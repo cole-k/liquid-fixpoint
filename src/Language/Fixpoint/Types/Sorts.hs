@@ -28,6 +28,7 @@ module Language.Fixpoint.Types.Sorts (
 
   , sortFTycon
   , intFTyCon
+  , bitVecFTyCon
   , boolFTyCon
   , realFTyCon
   , numFTyCon
@@ -150,7 +151,7 @@ defRealInfo = False
 defStrInfo  = False
 
 charFTyCon, intFTyCon, boolFTyCon, realFTyCon, funcFTyCon, numFTyCon :: FTycon
-strFTyCon, listFTyCon, mapFTyCon, bagFTyCon, setFTyCon :: FTycon
+strFTyCon, listFTyCon, mapFTyCon, bagFTyCon, setFTyCon, bitVecFTyCon :: FTycon
 intFTyCon  = TC (dummyLoc "int"       ) numTcInfo
 boolFTyCon = TC (dummyLoc boolLConName) defTcInfo
 realFTyCon = TC (dummyLoc "real"      ) realTcInfo
@@ -162,6 +163,7 @@ charFTyCon = TC (dummyLoc charConName ) defTcInfo
 setFTyCon  = TC (dummyLoc setConName  ) defTcInfo
 mapFTyCon  = TC (dummyLoc mapConName  ) defTcInfo
 bagFTyCon  = TC (dummyLoc bagConName  ) defTcInfo
+bitVecFTyCon = TC (dummyLoc bitVecName) defTcInfo
 
 isListConName :: LocSymbol -> Bool
 isListConName x = c == listConName || c == listLConName --"List"

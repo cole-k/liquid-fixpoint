@@ -101,6 +101,13 @@ import qualified SMTLIB.Backends.Process as Process
 import qualified Language.Fixpoint.Conditional.Z3 as Conditional.Z3
 import Control.Concurrent.Async (async)
 
+import qualified Language.Fixpoint.Parse as FP
+import qualified Language.Fixpoint.Horn.SMTParse as SMTParse
+
+import Control.Applicative (many)
+import Control.Monad.State (evalStateT)
+import Text.Megaparsec (runParser, errorBundlePretty, eof)
+
 {-
 runFile f
   = readFile f >>= runString
@@ -181,8 +188,17 @@ command Ctx{..} !cmd       = do
           let textResponse = "; SMT Says: " <> T.pack (show r)
           forM_ ctxLog $ \h ->
             Data.Text.IO.hPutStrLn h textResponse
-          when ctxVerbose $
+          when ctxVerbose $ do
             Data.Text.IO.putStrLn textResponse
+            when (r == Sat) $ do
+              let cmdBS' = runSmt2 ctxSymEnv GetModel
+              resp' <- SMTLIB.Backends.command ctxSolver cmdBS'
+              let respTxt' =
+                      TE.decodeUtf8With (const $ const $ Just ' ') $
+                      LBS.toStrict resp'
+              case parseSmtModel respTxt' of
+                Left err' -> putStrLn $ "Failed to parse model: " ++ err'
+                Right structuredModel -> print structuredModel
           return r
 
 smtSetMbqi :: Context -> IO ()
@@ -536,3 +552,69 @@ distinctLiterals xts = [ es | (_, es) <- tess ]
     tess             = Misc.groupList [(t, F.expr x) | (x, t) <- xts, notFun t]
     notFun           = not . F.isFunctionSortedReft . (`F.RR` F.trueReft)
     -- _notStr          = not . (F.strSort ==) . F.sr_sort . (`F.RR` F.trueReft)
+
+-- START ADDED CODE: SMT Model Parsing
+-- Note: These data types and parsers are for SMT-LIB model output.
+-- They leverage the Megaparsers from Language.Fixpoint.Horn.SMTParse,
+-- which are SMT-LIB2 compliant.
+
+-- Consider moving SmtModel and SmtModelDefineFun to Language.Fixpoint.Types or Language.Fixpoint.Smt.Types.
+data SmtModel = SmtModel [SmtModelDefineFun]
+  deriving (Show, Eq)
+
+data SmtModelDefineFun = SmtModelDefineFun
+  { smdfName :: F.Symbol             -- ^ Function/constant name
+  , smdfArgs :: [(F.Symbol, F.Sort)] -- ^ Arguments as (name, sort) pairs; empty for constants
+  , smdfSort :: F.Sort               -- ^ Return sort
+  , smdfBody :: F.Expr               -- ^ Value or expression defining the function/constant
+  }
+  deriving (Show, Eq)
+
+-- | Parser for an SMT (name Sort) pair, used in function arguments in a model.
+aSmtArgP :: FP.Parser (F.Symbol, F.Sort)
+aSmtArgP = FP.parens $ do
+  -- HACK: it seems like ! is valid in smtlib
+  argName <- FP.lexeme (FP.symbolRWithExtraChars ['!'])
+  argSort <- SMTParse.sortP
+  pure (argName, argSort)
+
+-- | Parser for a single (define-fun ...) entry in an SMT model.
+aSmtModelDefineFunP :: FP.Parser SmtModelDefineFun
+aSmtModelDefineFunP = FP.parens $ do
+  FP.reserved "define-fun"
+  funName <- FP.symbolP
+  funArgs <- FP.parens (many aSmtArgP) -- Parses "()" as empty list for nullary functions/constants
+  funSort <- SMTParse.sortP
+  funBody <- SMTParse.exprP
+  pure SmtModelDefineFun
+    { smdfName = funName
+    , smdfArgs = funArgs
+    , smdfSort = funSort
+    , smdfBody = funBody
+    }
+
+-- | Parser for the overall SMT model structure: (model ...).
+aSmtModelP :: FP.Parser SmtModel
+aSmtModelP =  FP.parens $ do
+    defines <- many aSmtModelDefineFunP
+    pure (SmtModel defines)
+
+-- | Top-level function to parse an SmtModel from Text.
+-- Returns Left error message on failure, Right SmtModel on success.
+-- Assumes the input Text is the complete SMT model string.
+parseSmtModel :: T.Text -> Either String SmtModel
+parseSmtModel inputText =
+  let
+    -- The parser needs to run within the StateT (PState) context,
+    -- and we want to consume leading/trailing SMT spaces/comments and ensure full parse.
+    parserAction = FP.spaces *> aSmtModelP <* eof
+    -- `initPState Nothing` provides the initial parser state with standard operator fixities.
+    -- This is needed by SMTParse.exprP.
+    initialState = FP.initPState Nothing
+    sourceName   = "SMT Model Input" :: SourceName -- Megaparsec SourceName, typically a filepath
+  in
+  case runParser (evalStateT parserAction initialState) sourceName (T.unpack inputText) of
+    Left parseErrorBundle -> Left (errorBundlePretty parseErrorBundle)
+    Right model           -> Right model
+
+-- END ADDED CODE: SMT Model Parsing

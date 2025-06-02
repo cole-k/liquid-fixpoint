@@ -40,6 +40,7 @@ module Language.Fixpoint.Parse (
   , upperIdR    -- Upper-case identifiers
   , symbolP
   , symbolR     -- Arbitrary Symbols
+  , symbolRWithExtraChars
   , locSymbolP
   , constantP   -- (Integer) Constants
   , natural
@@ -708,6 +709,12 @@ lowerIdR =
 symbolR :: ParserV v Symbol
 symbolR =
   condIdR (letterChar <|> char '_') (`S.member` symChars) isNotReserved "unexpected reserved word"
+
+symbolRWithExtraChars :: [Char] -> ParserV v Symbol
+symbolRWithExtraChars chars =
+  condIdR (letterChar <|> char '_') (`S.member` allowedChars) isNotReserved "unexpected reserved word"
+  where
+    allowedChars = symChars <> S.fromList chars
 
 isNotReserved :: String -> Bool
 isNotReserved s = not (s `S.member` reservedNames)

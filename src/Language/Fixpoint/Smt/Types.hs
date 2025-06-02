@@ -59,6 +59,7 @@ data Command      = Push
                   | Distinct [Expr] -- {v:[Expr] | 2 <= len v}
                   | GetValue [Symbol]
                   | CMany    [Command]
+                  | GetModel
                   deriving (Eq, Show)
 
 instance PPrint Command where
@@ -81,6 +82,7 @@ ppCmd (AssertAx _)  = text "AssertAxiom ..."
 ppCmd Distinct {} = text "Distinct ..."
 ppCmd GetValue {} = text "GetValue ..."
 ppCmd CMany {}    = text "CMany ..."
+ppCmd GetModel    = text "GetModel"
 
 -- | Responses received from SMT engine
 data Response     = Ok

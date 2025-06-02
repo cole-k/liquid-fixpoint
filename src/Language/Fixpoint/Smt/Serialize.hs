@@ -245,6 +245,7 @@ instance SMTLIB2 Command where
   smt2 env (CMany cmds)        = smt2many (smt2 env <$> cmds)
   smt2 _   Exit                = "(exit)"
   smt2 _   SetMbqi             = "(set-option :smt.mbqi true)"
+  smt2 _   GetModel            = "(get-model)"
 
 instance SMTLIB2 (Triggered Expr) where
   smt2 env (TR NoTrigger e)       = smt2 env e

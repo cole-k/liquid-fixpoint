@@ -19,6 +19,8 @@ import           Text.Megaparsec.Char           (space1, string, char)
 import qualified Data.HashMap.Strict            as M
 import qualified Data.Text as T
 import qualified Text.Megaparsec.Char.Lexer  as L
+import Language.Fixpoint.Types.Sorts (sizedBitVecSort)
+import qualified Text.Megaparsec.Char as L (hexDigitChar)
 
 type FParser = FP.Parser
 
@@ -75,6 +77,15 @@ fIntP = fromInteger <$> natural
 natural :: FParser Integer
 natural = lexeme FP.naturalR <?> "nat literal"
 
+decimal :: FParser Integer
+decimal = lexeme L.decimal <?> "decimal literal"
+
+hexStr :: FParser String
+hexStr = lexeme (some L.hexDigitChar) <?> "hexadecimal string literal"
+
+binStr :: FParser String
+binStr = lexeme (some (char '0' <|> char '1')) <?> "binary string literal"
+
 double :: FParser Double
 double = lexeme L.float <?> "float literal"
 
@@ -98,6 +109,9 @@ fTyConP
   <|> (reserved "bool"    >> return F.boolFTyCon)
   <|> (reserved "num"     >> return F.numFTyCon)
   <|> (reserved "Str"     >> return F.strFTyCon)
+  -- HACK: Prefix bare numbers with Size. From what I can tell
+  -- only BitVecs take bare numbers as input.
+  <|> ((\size -> F.symbolFTycon . F.dummyLoc . F.symbol $ "Size" <> show size) <$> decimal)
   <|> (FP.mkFTycon        =<<  locUpperIdP)
 
 
@@ -113,8 +127,31 @@ fSymconstP =  F.SL . T.pack <$> stringLiteral
 -- | Parser for literal numeric constants: floats or integers without sign.
 constantP :: FParser F.Constant
 constantP =
-     try (F.R <$> double)   -- float literal
- <|> F.I <$> natural        -- nat literal
+     try (F.R <$> double)     -- float literal
+ <|> try (F.I <$> natural)    -- nat literal
+ <|> uncurry F.L <$> bitvecP  -- bitvector literal
+
+bitvecP :: FParser (T.Text, F.Sort)
+bitvecP = hexBitvecP <|> binBitvecP
+
+-- #x + hexstring; sort argument is a FTC "Size" + 8*len(hexstring)
+hexBitvecP :: FParser (T.Text, F.Sort)
+hexBitvecP = do
+  _ <- char '#'
+  _ <- char 'x'
+  hex <- hexStr
+  let size = show $ 8 * length hex
+  pure (T.pack $ "#x" <> hex, sizedBitVecSort (F.symbol $ "Size" <> size))
+
+-- #b + binstring; sort argument is a FTC "Size" + len(binstring)
+binBitvecP :: FParser (T.Text, F.Sort)
+binBitvecP = do
+  _ <- char '#'
+  _ <- char 'b'
+  bin <- binStr
+  let size = show $ length bin
+  pure (T.pack $ "#b" <> bin, sizedBitVecSort (F.symbol $ "Size" <> size))
+
 
 -------------------------------------------------------------------------------
 hornP :: FParser H.TagQuery
@@ -281,6 +318,9 @@ sortP =  (string "@" >> (F.FVar <$> parens fIntP))
      <|> (F.FObj . F.symbol <$> lowerIdP)
      <|> try (parens (reserved "func" >> (mkFunc <$> fIntP <*> sMany sortP <*> sortP)))
      <|> try (parens (reserved "list" >> (mkList <$> sortP)))
+     -- HACK: We already properly parse e.g. (BitVec 32) as an app, so just
+     -- ignore the _ if you see it (_ BitVec 32)
+     <|> try (parens (reserved "_" *> (F.fAppTC <$> fTyConP <*> many sortP)))
      <|> parens (F.fAppTC <$> fTyConP <*> many sortP)
 
 mkFunc :: Int -> [F.Sort] -> F.Sort -> F.Sort
