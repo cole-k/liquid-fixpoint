@@ -23,6 +23,7 @@ module Language.Fixpoint.Smt.Interface (
 
     -- * Responses
     , Response (..)
+    , respValid
 
     -- * Typeclass for SMTLIB2 conversion
     , SMTLIB2 (..)
@@ -138,7 +139,7 @@ checkValid' :: Context -> [(Symbol, Sort)] -> Expr -> Expr -> IO Bool
 checkValid' me xts p q = do
   smtDecls me xts
   smtAssert me $ pAnd [p, PNot q]
-  smtCheckUnsat me
+  respValid <$> smtCheckUnsat False me
 
 -- | If you already HAVE a context, where all the variables have declared types
 --   (e.g. if you want to make MANY repeated Queries)
@@ -150,7 +151,7 @@ checkValids cfg f xts ps
        smtDecls me xts
        forM ps $ \p ->
           smtBracket me "checkValids" $
-            smtAssert me (PNot p) >> smtCheckUnsat me
+            smtAssert me (PNot p) >> (respValid <$> smtCheckUnsat False me)
 
 -- debugFile :: FilePath
 -- debugFile = "DEBUG.smt2"
@@ -161,9 +162,9 @@ checkValids cfg f xts ps
 
 --------------------------------------------------------------------------------
 {-# SCC command #-}
-command              :: Context -> Command -> IO Response
+command              :: Bool -> Context -> Command -> IO Response
 --------------------------------------------------------------------------------
-command Ctx{..} !cmd       = do
+command collectModel Ctx{..} !cmd       = do
   -- whenLoud $ do LTIO.appendFile debugFile (s <> "\n")
   --               LTIO.putStrLn ("CMD-RAW:" <> s <> ":CMD-RAW:DONE")
   forM_ ctxLog $ \h -> do
@@ -190,16 +191,18 @@ command Ctx{..} !cmd       = do
             Data.Text.IO.hPutStrLn h textResponse
           when ctxVerbose $ do
             Data.Text.IO.putStrLn textResponse
-            when (r == Sat) $ do
+          case r of
+            Sat _ | collectModel -> do
               let cmdBS' = runSmt2 ctxSymEnv GetModel
               resp' <- SMTLIB.Backends.command ctxSolver cmdBS'
               let respTxt' =
                       TE.decodeUtf8With (const $ const $ Just ' ') $
                       LBS.toStrict resp'
               case parseSmtModel respTxt' of
-                Left err' -> putStrLn $ "Failed to parse model: " ++ err'
-                Right structuredModel -> print structuredModel
-          return r
+                Left err' -> panic $ "Failed to parse model: " ++ err'
+                Right m ->
+                  pure . Sat . Just $ m
+            _ -> return r
 
 smtSetMbqi :: Context -> IO ()
 smtSetMbqi me = interact' me SetMbqi
@@ -208,7 +211,8 @@ type SmtParser a = Parser T.Text a
 
 responseP :: SmtParser Response
 responseP = {- SCC "responseP" -} A.char '(' *> sexpP
-         <|> A.string "sat"     *> return Sat
+         -- HACK: return an empty value that we will fill later
+         <|> A.string "sat"     *> return (Sat Nothing)
          <|> A.string "unsat"   *> return Unsat
          <|> A.string "unknown" *> return Unknown
 
@@ -412,9 +416,9 @@ deconSort t = case functionSort t of
 -- hack now this is used only for checking gradual condition.
 smtCheckSat :: Context -> Expr -> IO Bool
 smtCheckSat me p
- = smtAssert me p >> (ans <$> command me CheckSat)
+ = smtAssert me p >> (ans <$> command False me CheckSat)
  where
-   ans Sat = True
+   ans (Sat _) = True
    ans _   = False
 
 smtAssert :: Context -> Expr -> IO ()
@@ -438,8 +442,8 @@ smtAssertAxiom me p  = interact' me (AssertAx p)
 smtDistinct :: Context -> [Expr] -> IO ()
 smtDistinct me az = interact' me (Distinct az)
 
-smtCheckUnsat :: Context -> IO Bool
-smtCheckUnsat me  = respSat <$> command me CheckSat
+smtCheckUnsat :: Bool -> Context -> IO Response
+smtCheckUnsat collectModel me  = command collectModel me CheckSat
 
 smtBracketAt :: SrcSpan -> Context -> String -> IO a -> IO a
 smtBracketAt sp x y z = smtBracket x y z `catch` dieAt sp
@@ -451,14 +455,14 @@ smtBracket me _msg a   = do
   smtPop me
   return r
 
-respSat :: Response -> Bool
-respSat Unsat   = True
-respSat Sat     = False
-respSat Unknown = False
-respSat r       = die $ err dummySpan $ text ("crash: SMTLIB2 respSat = " ++ show r)
+respValid :: Response -> Bool
+respValid Unsat   = True
+respValid (Sat _) = False
+respValid Unknown = False
+respValid r       = die $ err dummySpan $ text ("crash: SMTLIB2 respValid = " ++ show r)
 
 interact' :: Context -> Command -> IO ()
-interact' me cmd  = void $ command me cmd
+interact' me cmd  = void $ command False me cmd
 
 
 makeTimeout :: Config -> [Builder]
@@ -553,22 +557,10 @@ distinctLiterals xts = [ es | (_, es) <- tess ]
     notFun           = not . F.isFunctionSortedReft . (`F.RR` F.trueReft)
     -- _notStr          = not . (F.strSort ==) . F.sr_sort . (`F.RR` F.trueReft)
 
--- START ADDED CODE: SMT Model Parsing
--- Note: These data types and parsers are for SMT-LIB model output.
--- They leverage the Megaparsers from Language.Fixpoint.Horn.SMTParse,
--- which are SMT-LIB2 compliant.
-
--- Consider moving SmtModel and SmtModelDefineFun to Language.Fixpoint.Types or Language.Fixpoint.Smt.Types.
-data SmtModel = SmtModel [SmtModelDefineFun]
-  deriving (Show, Eq)
-
-data SmtModelDefineFun = SmtModelDefineFun
-  { smdfName :: F.Symbol             -- ^ Function/constant name
-  , smdfArgs :: [(F.Symbol, F.Sort)] -- ^ Arguments as (name, sort) pairs; empty for constants
-  , smdfSort :: F.Sort               -- ^ Return sort
-  , smdfBody :: F.Expr               -- ^ Value or expression defining the function/constant
-  }
-  deriving (Show, Eq)
+-- varSolution :: SmtModelDefineFun -> Maybe (F.Symbol, F.Expr)
+-- varSolution SmtModelDefineFun{..}
+--   | null smdfArgs = Just (smdfName, smdfBody)
+--   | otherwise     = Nothing
 
 -- | Parser for an SMT (name Sort) pair, used in function arguments in a model.
 aSmtArgP :: FP.Parser (F.Symbol, F.Sort)
@@ -616,5 +608,3 @@ parseSmtModel inputText =
   case runParser (evalStateT parserAction initialState) sourceName (T.unpack inputText) of
     Left parseErrorBundle -> Left (errorBundlePretty parseErrorBundle)
     Right model           -> Right model
-
--- END ADDED CODE: SMT Model Parsing

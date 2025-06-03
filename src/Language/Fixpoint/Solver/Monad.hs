@@ -5,6 +5,7 @@
 module Language.Fixpoint.Solver.Monad
        ( -- * Type
          SolveM
+       , FilteredQs(..)
 
          -- * Execution
        , runSolverM
@@ -42,19 +43,21 @@ import qualified Language.Fixpoint.Types.Visitor as F
 -- import qualified Language.Fixpoint.Types.Errors  as E
 import           Language.Fixpoint.Smt.Serialize ()
 import           Language.Fixpoint.Types.PrettyPrint ()
+import           Language.Fixpoint.Smt.Types
 import           Language.Fixpoint.Smt.Interface
 -- import qualified Language.Fixpoint.Smt.Theories as Thy
 import           Language.Fixpoint.Solver.Sanitize
 import           Language.Fixpoint.Solver.Stats
 import           Language.Fixpoint.Graph.Types (SolverInfo (..))
 -- import           Language.Fixpoint.Solver.Solution
--- import           Data.Maybe           (catMaybes)
+import           Data.Foldable        (foldMap')
 import           Data.List            (partition)
 -- import           Data.Char            (isUpper)
 import           Control.Monad.State.Strict
 import qualified Data.HashMap.Strict as M
-import           Data.Maybe (catMaybes)
+import           Data.Maybe (maybeToList)
 import           Control.Exception.Base (bracket)
+import           Text.PrettyPrint.HughesPJ (text)
 
 --------------------------------------------------------------------------------
 -- | Solver Monadic API --------------------------------------------------------
@@ -163,31 +166,50 @@ filterRequired :: F.Cand a -> F.Expr -> SolveM ann [a]
 --------------------------------------------------------------------------------
 filterRequired = error "TBD:filterRequired"
 
+data FilteredQs a = FilteredQs
+  { validQs :: [a]
+  , counterexamples :: [SmtModel]
+  }
+
+instance Semigroup (FilteredQs a) where
+  fqs1 <> fqs2 = FilteredQs
+    { validQs = validQs fqs1 <> validQs fqs2
+    , counterexamples = counterexamples fqs1 <> counterexamples fqs2
+    }
+
+instance Monoid (FilteredQs a) where
+  mappend = (<>)
+  mempty = FilteredQs [] []
+
 --------------------------------------------------------------------------------
 -- | `filterValid p [(q1, x1),...,(qn, xn)]` returns the list `[ xi | p => qi]`
 --------------------------------------------------------------------------------
 {-# SCC filterValid #-}
-filterValid :: F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann [a]
+filterValid :: Bool -> F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann (FilteredQs a)
 --------------------------------------------------------------------------------
-filterValid sp p qs = do
+filterValid collectModel sp p qs = do
   qs' <- withContext $ \me ->
            smtBracket me "filterValidLHS" $
-             filterValid_ sp p qs me
+             filterValid_ collectModel sp p qs me
   -- stats
   incBrkt
   incChck (length qs)
-  incVald (length qs')
+  incVald (length . validQs $ qs')
   return qs'
 
 {-# SCC filterValid_ #-}
-filterValid_ :: F.SrcSpan -> F.Expr -> F.Cand a -> Context -> IO [a]
-filterValid_ sp p qs me = catMaybes <$> do
+filterValid_ :: Bool -> F.SrcSpan -> F.Expr -> F.Cand a -> Context -> IO (FilteredQs a)
+filterValid_ collectModel sp p qs me = foldMap' id <$> do
   smtAssert me p
   forM qs $ \(q, x) ->
     smtBracketAt sp me "filterValidRHS" $ do
       smtAssert me (F.PNot q)
-      valid <- smtCheckUnsat me
-      return $ if valid then Just x else Nothing
+      smtResp <- smtCheckUnsat collectModel me
+      case smtResp of
+        Unsat     -> return $ FilteredQs [x] []
+        Sat model -> return $ FilteredQs [] (maybeToList model)
+        Unknown   -> return $ FilteredQs [] []
+        _         -> F.die $ F.err F.dummySpan $ text ("crash: SMTLIB2 response = " ++ show smtResp)
 
 --------------------------------------------------------------------------------
 -- | `filterValidGradual ps [(x1, q1),...,(xn, qn)]` returns the list `[ xi | p => qi]`
@@ -221,7 +243,7 @@ filterValidOne_ p qs me = do
   forM qs $ \(q, x) ->
     smtBracket me "filterValidRHS" $ do
       smtAssert me (F.PNot q)
-      valid <- smtCheckUnsat me
+      valid <- respValid <$> smtCheckUnsat False me
       return ((q, x), valid)
 
 smtEnablembqi :: SolveM ann ()

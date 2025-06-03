@@ -118,6 +118,7 @@ data Config = Config
   , fuel                :: Maybe Int   -- ^ Maximum PLE "fuel" (unfold depth) (default=infinite)
   , restOrdering        :: String      -- ^ Term ordering for use in REST
   , noSmtHorn           :: Bool        -- ^ Do not use (new) SMTLIB horn parser
+  , modelCounterexamples :: Bool       -- ^ Collect models witnessing failing constraints from the solver
   } deriving (Eq,Data,Typeable,Show,Generic)
 
 instance Default Config where
@@ -297,6 +298,7 @@ defConfig = Config {
         &= name "rest-ordering"
         &= help "Ordering Constraint Algebra to use for REST"
   , noSmtHorn                = False &= help "Do not use SMTLIB horn format"
+  , modelCounterexamples     = False &= help "Collect models witnessing unsolvable constraints"
   }
   &= verbosity
   &= program "fixpoint"

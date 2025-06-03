@@ -23,6 +23,7 @@ module Language.Fixpoint.Types.Constraints (
   , convertFormat
   , sinfoToFInfo
   , Solver
+  , ModelCounterexample
 
    -- * Serializing
   , toFixpoint
@@ -908,7 +909,8 @@ simpcToSubc env s = SubC
 ---------------------------------------------------------------------------
 -- | Top level Solvers ----------------------------------------------------
 ---------------------------------------------------------------------------
-type Solver a = C.Config -> FInfo a -> IO (Result (Integer, a))
+type ModelCounterexample = [(Symbol, Expr)]
+type Solver a = C.Config -> FInfo a -> IO (Result (Integer, a, Maybe ModelCounterexample))
 
 --------------------------------------------------------------------------------
 saveQuery :: (Fixpoint a) => C.Config -> FInfo a -> IO ()

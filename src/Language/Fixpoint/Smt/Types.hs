@@ -3,6 +3,8 @@
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE UndecidableInstances      #-}
+{-# LANGUAGE DeriveAnyClass            #-}
+{-# LANGUAGE DeriveGeneric             #-}
 
 
 -- | This module contains the types defining an SMTLIB2 interface.
@@ -17,6 +19,10 @@ module Language.Fixpoint.Smt.Types (
 
     -- * Responses
     , Response (..)
+
+    -- * SMT model
+    , SmtModel (..)
+    , SmtModelDefineFun (..)
 
     -- * Typeclass for SMTLIB2 conversion
     , SMTLIB2 (..)
@@ -34,6 +40,8 @@ import qualified Data.Text                as T
 import           Text.PrettyPrint.HughesPJ
 import qualified SMTLIB.Backends
 
+import           Control.DeepSeq (NFData)
+import           GHC.Generics
 import           System.IO                (Handle)
 -- import           Language.Fixpoint.Misc   (traceShow)
 
@@ -86,7 +94,9 @@ ppCmd GetModel    = text "GetModel"
 
 -- | Responses received from SMT engine
 data Response     = Ok
-                  | Sat
+                  -- | Includes all of the variable (i.e. not function) instantiations
+                  --   from the model
+                  | Sat (Maybe SmtModel)
                   | Unsat
                   | Unknown
                   | Values [(Symbol, T.Text)]
@@ -105,6 +115,17 @@ data Context = Ctx
   , ctxVerbose :: !Bool
   , ctxSymEnv  :: !SymEnv
   }
+
+data SmtModel = SmtModel [SmtModelDefineFun]
+  deriving (Show, Eq, NFData, Generic)
+
+data SmtModelDefineFun = SmtModelDefineFun
+  { smdfName :: Symbol           -- ^ Function/constant name
+  , smdfArgs :: [(Symbol, Sort)] -- ^ Arguments as (name, sort) pairs; empty for constants
+  , smdfSort :: Sort             -- ^ Return sort
+  , smdfBody :: Expr             -- ^ Value or expression defining the function/constant
+  }
+  deriving (Show, Eq, NFData, Generic)
 
 --------------------------------------------------------------------------------
 -- | AST Conversion: Types that can be serialized ------------------------------

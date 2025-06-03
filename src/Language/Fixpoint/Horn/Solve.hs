@@ -96,7 +96,7 @@ eliminate cfg q
 
 ----------------------------------------------------------------------------------
 solve :: (F.PPrint a, NFData a, F.Loc a, Show a, F.Fixpoint a) => F.Config -> H.Query a
-       -> IO (F.Result (Integer, a))
+       -> IO (F.Result (Integer, a, Maybe F.ModelCounterexample))
 ----------------------------------------------------------------------------------
 solve cfg qry = do
   let c = Tx.uniq $ Tx.flatten $ H.qCstr qry

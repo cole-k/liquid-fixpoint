@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
 
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 
@@ -11,7 +12,7 @@
 
 module Language.Fixpoint.Solver.Solve (solve, solverInfo) where
 
-import           Control.Monad (when, filterM)
+import           Control.Monad (when)
 import           Control.Monad.Reader
 import           Control.Monad.State.Strict (modify)
 import           Language.Fixpoint.Misc
@@ -46,7 +47,7 @@ mytrace :: String -> a -> a
 mytrace _ x = {- trace s -} x
 
 --------------------------------------------------------------------------------
-solve :: (NFData a, F.Fixpoint a, Show a, F.Loc a) => Config -> F.SInfo a -> IO (F.Result (Integer, a))
+solve :: (NFData a, F.Fixpoint a, Show a, F.Loc a) => Config -> F.SInfo a -> IO (F.Result (Integer, a, Maybe T.SmtModel))
 --------------------------------------------------------------------------------
 
 solve cfg fi = do
@@ -118,7 +119,7 @@ solve_ :: (NFData a, F.Fixpoint a, F.Loc a)
        -> Sol.Solution
        -> S.HashSet F.KVar
        -> W.Worklist a
-       -> SolveM a (F.Result (Integer, a), Stats)
+       -> SolveM a (F.Result (Integer, a, Maybe T.SmtModel), Stats)
 --------------------------------------------------------------------------------
 solve_ cfg fi s0 ks wkl = do
   let s1   = F.notracepp "solve_ " $ {-# SCC "sol-init" #-} S.init cfg fi ks
@@ -131,7 +132,7 @@ solve_ cfg fi s0 ks wkl = do
 
   (fi1, s4, res1) <- case resStatus res0 of  {- first run the interpreter -}
     Unsafe _ bads | not (noLazyPLE cfg) && rewriteAxioms cfg && interpreter cfg -> do
-      fi1 <- doInterpret cfg fi (map fst $ mytrace ("before the Interpreter " ++ show (length bads) ++ " constraints remain") bads)
+      fi1 <- doInterpret cfg fi (map (\(x, _, _) -> x) $ mytrace ("before the Interpreter " ++ show (length bads) ++ " constraints remain") bads)
       (s4, res1) <-  sendConcreteBindingsToSMT F.emptyIBindEnv $ \bindingsInSmt -> do
         s4    <- {- SCC "sol-refine" -} refine bindingsInSmt s3 wkl
         res1  <- {- SCC "sol-result" -} result bindingsInSmt cfg wkl s4
@@ -141,7 +142,7 @@ solve_ cfg fi s0 ks wkl = do
 
   res2  <- case resStatus res1 of  {- then run normal PLE on remaining unsolved constraints -}
     Unsafe _ bads2 | not (noLazyPLE cfg) && rewriteAxioms cfg -> do
-      doPLE cfg fi1 (map fst $ mytrace ("before z3 PLE " ++ show (length bads2) ++ " constraints remain") bads2)
+      doPLE cfg fi1 (map (\(x, _, _) -> x) $ mytrace ("before z3 PLE " ++ show (length bads2) ++ " constraints remain") bads2)
       sendConcreteBindingsToSMT F.emptyIBindEnv $ \bindingsInSmt -> do
         s5    <- {- SCC "sol-refine" -} refine bindingsInSmt s4 wkl
         result bindingsInSmt cfg wkl s5
@@ -209,7 +210,7 @@ refineC bindingsInSmt _i s c =
         then return (False, s)
         else do be     <- getBinds
                 let lhs = runReader (S.lhsPred bindingsInSmt (F.coerceBindEnv ef be) s c) ef
-                kqs    <- filterValid (cstrSpan c) lhs rhs
+                kqs    <- validQs <$> filterValid False (cstrSpan c) lhs rhs
                 return  $ S.update s ks kqs
   where
     _ci       = F.subcId c
@@ -244,17 +245,16 @@ result
   -> Config
   -> W.Worklist a
   -> Sol.Solution
-  -> SolveM a (F.Result (Integer, a))
+  -> SolveM a (F.Result (Integer, a, Maybe T.SmtModel))
 --------------------------------------------------------------------------------
 result bindingsInSmt cfg wkl s =
   sendConcreteBindingsToSMT bindingsInSmt $ \bindingsInSmt2 -> do
     lift $ writeLoud "Computing Result"
     stat    <- result_ bindingsInSmt2 cfg wkl s
-    lift $ whenLoud $ putStrLn $ "RESULT: " ++ show (F.sid <$> stat)
-
+    lift $ whenLoud $ putStrLn $ "RESULT: " ++ show (F.sid . snd <$> stat)
     F.Result (ci <$> stat) <$> solResult cfg s <*> solNonCutsResult s <*> return mempty
   where
-    ci c = (F.subcId c, F.sinfo c)
+    ci (exprValid, c) = (F.subcId c, F.sinfo c, getModel exprValid)
 
 solResult :: Config -> Sol.Solution -> SolveM ann (M.HashMap F.KVar F.Expr)
 solResult cfg = minimizeResult cfg . Sol.result
@@ -271,11 +271,12 @@ result_
   -> Config
   -> W.Worklist a
   -> Sol.Solution
-  -> SolveM a (F.FixResult (F.SimpC a))
+  -> SolveM a (F.FixResult (ExprValid, F.SimpC a))
 result_ bindingsInSmt cfg w s = do
-  filtered <- filterM (isUnsat bindingsInSmt s) cs
+  invalidCs <- filter (\(res, _) -> not . validToBool $ res) <$>
+    mapM (\c -> (,c) <$> isUnsat (modelCounterexamples cfg) bindingsInSmt s c) cs
   sts      <- stats
-  pure $ res sts filtered
+  pure $ res sts invalidCs
   where
     cs          = isChecked cfg (W.unsatCandidates w)
     res sts []  = F.Safe sts
@@ -308,28 +309,28 @@ minimizeConjuncts :: F.Expr -> SolveM ann F.Expr
 minimizeConjuncts p = F.pAnd <$> go (F.conjuncts p) []
   where
     go []     acc   = return acc
-    go (p:ps) acc   = do b <- isValid F.dummySpan (F.pAnd (acc ++ ps)) p
+    go (p:ps) acc   = do b <- validToBool <$> isValid False F.dummySpan (F.pAnd (acc ++ ps)) p
                          if b then go ps acc
                               else go ps (p:acc)
 
 --------------------------------------------------------------------------------
 isUnsat
-  :: (F.Loc a, NFData a) => F.IBindEnv -> Sol.Solution -> F.SimpC a -> SolveM a Bool
+  :: (F.Loc a, NFData a) => Bool -> F.IBindEnv -> Sol.Solution -> F.SimpC a -> SolveM a ExprValid
 --------------------------------------------------------------------------------
-isUnsat bindingsInSmt s c = do
+isUnsat collectModel bindingsInSmt s c = do
   -- lift   $ printf "isUnsat %s" (show (F.subcId c))
   _     <- tickIter True -- newScc
   be    <- getBinds
   ef <- T.ctxElabF <$> getContext
   let lp = runReader (S.lhsPred bindingsInSmt (F.coerceBindEnv ef be) s c) ef
   let rp = rhsPred        c
-  res   <- not <$> isValid (cstrSpan c) lp rp
+  res   <- isValid collectModel (cstrSpan c) lp rp
   lift   $ whenLoud $ showUnsat res (F.subcId c) lp rp
   return res
 
-showUnsat :: Bool -> Integer -> F.Pred -> F.Pred -> IO ()
+showUnsat :: ExprValid -> Integer -> F.Pred -> F.Pred -> IO ()
 showUnsat u i lP rP = {- when u $ -} do
-  putStrLn $ printf   "UNSAT id %s %s" (show i) (show u)
+  putStrLn $ printf   "UNSAT id %s %s" (show i) (show $ validToBool u)
   putStrLn $ showpp $ "LHS:" <+> pprint lP
   putStrLn $ showpp $ "RHS:" <+> pprint rP
 
@@ -342,10 +343,29 @@ rhsPred c
   | isTarget c = F.crhs c
   | otherwise  = errorstar $ "rhsPred on non-target: " ++ show (F.sid c)
 
+
+data ExprValid
+  = Valid
+  | Invalid [T.SmtModel]
+  deriving (Eq, Show)
+
+validToBool :: ExprValid -> Bool
+validToBool Valid = True
+validToBool (Invalid _) = False
+
+getModel :: ExprValid -> Maybe T.SmtModel
+getModel Valid = Nothing
+getModel (Invalid []) = Nothing
+getModel (Invalid (model:_)) = Just model
+
 --------------------------------------------------------------------------------
-isValid :: F.SrcSpan -> F.Expr -> F.Expr -> SolveM ann Bool
+isValid :: Bool -> F.SrcSpan -> F.Expr -> F.Expr -> SolveM ann ExprValid
 --------------------------------------------------------------------------------
-isValid sp p q = not . null <$> filterValid sp p [(q, ())]
+isValid collectModel sp p q = do
+  filteredQs <- filterValid collectModel sp p [(q, ())]
+  pure $ if (not . null . validQs $ filteredQs)
+    then Valid
+    else Invalid (counterexamples filteredQs)
 
 cstrSpan :: (F.Loc a) => F.SimpC a -> F.SrcSpan
 cstrSpan = F.srcSpan . F.sinfo

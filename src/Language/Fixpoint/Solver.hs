@@ -5,6 +5,7 @@
 {-# LANGUAGE DoAndIfThenElse     #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards     #-}
 
 module Language.Fixpoint.Solver (
     -- * Invoke Solver on an FInfo
@@ -48,6 +49,7 @@ import           Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify)
 import qualified Language.Fixpoint.Solver.Solve     as Sol
 import           Language.Fixpoint.Types.Config
 import           Language.Fixpoint.Types.Errors
+import           Language.Fixpoint.Smt.Types (SmtModel(..), SmtModelDefineFun(..))
 import           Language.Fixpoint.Utils.Files            hiding (Result)
 import           Language.Fixpoint.Misc
 import           Language.Fixpoint.Utils.Statistics (statistics)
@@ -70,7 +72,7 @@ solveFQ cfg = do
     cfg'       <- withPragmas cfg opts
     let fi'     = ignoreQualifiers cfg' fi
     r          <- solve cfg' fi'
-    resultExitCode cfg (fst <$> r)
+    resultExitCode cfg ((\(a, _, _) -> a) <$> r)
   where
     file    = srcFile      cfg
 
@@ -186,7 +188,7 @@ solveNative !cfg !fi0 = solveNative' cfg fi0
                           `catch`
                              (return . crashResult (errorMap fi0))
 
-crashResult :: (PPrint a) => ErrorMap a -> Error -> Result (Integer, a)
+crashResult :: (PPrint a) => ErrorMap a -> Error -> Result (Integer, a, Maybe ModelCounterexample)
 crashResult m err' = Result res mempty mempty mempty
   where
     res           = Crash es msg
@@ -196,19 +198,19 @@ crashResult m err' = Result res mempty mempty mempty
         --  {-dbgFalse-} True  = "Sorry, unexpected panic in liquid-fixpoint!\n" ++ crashMessage es
         | otherwise = showpp err'
 
-_crashMessage :: [((Integer, a), Maybe String) ] -> String
-_crashMessage es = L.intercalate "\n" [ msg i s | ((i,_), Just s) <- es ]
+_crashMessage :: [((Integer, a, Maybe ModelCounterexample), Maybe String) ] -> String
+_crashMessage es = L.intercalate "\n" [ msg i s | ((i,_,_), Just s) <- es ]
   where
     msg i s = "Error in constraint " ++ show i ++ ":\n" ++ s
 
 -- | Unpleasant hack to save meta-data that can be recovered from SrcSpan
 type ErrorMap a = HashMap.HashMap SrcSpan a
 
-findError :: ErrorMap a -> Error1 -> Maybe ((Integer, a), Maybe String)
+findError :: ErrorMap a -> Error1 -> Maybe ((Integer, a, Maybe ModelCounterexample), Maybe String)
 findError m e = do
   ann <- HashMap.lookup (errLoc e) m
   let str = render (errMsg e)
-  return ((-1, ann), Just str)
+  return ((-1, ann, Nothing), Just str)
 
 -- The order is important here: we want the "binders" to get the "precedence"
 errorMap :: (Loc a) => FInfo a -> ErrorMap a
@@ -278,7 +280,14 @@ solveNative' !cfg !fi0 = do
   when (save cfg) $ saveSolution cfg res
   -- writeLoud $ "\nSolution:\n"  ++ showpp (resSolution res)
   -- colorStrLn (colorResult stat) (show stat)
-  return res
+  return $ getVarSolutions <$> res
+
+  where
+    getVarSolutions (a, b, Nothing) = (a, b, Nothing)
+    getVarSolutions (a, b, Just (SmtModel defs)) = (a, b, Just . catMaybes $ map varSolution defs)
+    varSolution SmtModelDefineFun{..}
+      | null smdfArgs = Just (smdfName, smdfBody)
+      | otherwise     = Nothing
 
 --------------------------------------------------------------------------------
 -- | Parse External Qualifiers -------------------------------------------------
