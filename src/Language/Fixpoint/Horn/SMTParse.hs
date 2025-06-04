@@ -132,7 +132,7 @@ constantP =
  <|> uncurry F.L <$> bitvecP  -- bitvector literal
 
 bitvecP :: FParser (T.Text, F.Sort)
-bitvecP = hexBitvecP <|> binBitvecP
+bitvecP = try hexBitvecP <|> binBitvecP
 
 -- #x + hexstring; sort argument is a FTC "Size" + 8*len(hexstring)
 hexBitvecP :: FParser (T.Text, F.Sort)
