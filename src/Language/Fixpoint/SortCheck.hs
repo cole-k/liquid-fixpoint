@@ -321,8 +321,8 @@ elabFSetBagZ3 = go
     go (EBin b e1 e2)     = EBin b (go e1) (go e2)
     go (ELet x e1 e2)     = ELet x (go e1) (go e2)
     go (EIte e1 e2 e3)    = EIte   (go e1) (go e2) (go e3)
-    go (ECst e t)         = ECst   (go e) t
-    go (ELam b e)         = ELam b (go e)
+    go (ECst e t)         = ECst   (go e) (goS t)
+    go (ELam (x, s) e)    = ELam (x, goS s) (go e)
     go (ETApp e t)        = ETApp  (go e) t
     go (ETAbs e t)        = ETAbs  (go e) t
     go (PAnd es)          = PAnd   (go <$> es)
@@ -331,11 +331,27 @@ elabFSetBagZ3 = go
     go (PImp e1 e2)       = PImp   (go e1) (go e2)
     go (PIff e1 e2)       = PIff   (go e1) (go e2)
     go (PAtom r e1 e2)    = PAtom r (go e1) (go e2)
-    go (PAll   bs e)      = PAll bs (go e)
-    go (PExist bs e)      = PExist bs (go e)
+    go (PAll   bs e)      = PAll   (fmap (second goS) bs) (go e)
+    go (PExist bs e)      = PExist (fmap (second goS) bs) (go e)
     go (ECoerc a t e)     = ECoerc a t (go e)
     go (PKVar k tsu su)       = PKVar k tsu (mapKVarSubst go su)
     go e                  = e
+
+    -- Rewrite Set/Bag sort annotations to their array-based encodings so
+    -- that bound variables introduced by ELam/PAll/PExist (and explicit
+    -- ECst sort annotations) line up with the rewrites performed on Set/Bag
+    -- /operators/ in expression position. Without this, a binder like
+    -- @exists ((x (Set_Set int))) ... arr_map_or ... x ...@ produced by
+    -- callers that perform their own KVar elimination before elaboration
+    -- (e.g. an external solver pipeline) would fail sort-checking, since
+    -- @arr_map_or@ expects @(Array_t int bool)@ but @x@ is annotated as
+    -- @(Set_Set int)@.
+    goS = Vis.mapSort goS1
+    goS1 t@(FApp (FTC c) tElem)
+      | isSet (FTC c) = arraySort tElem boolSort
+      | isBag (FTC c) = arraySort tElem intSort
+      | otherwise     = t
+    goS1 t            = t
 
 -- | Reverse transformation of elabFSetBagZ3: converts array representations back to set/bag operations
 unElabFSetBagZ3 :: Expr -> Expr
