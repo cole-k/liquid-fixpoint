@@ -108,6 +108,7 @@ data Config = Config
   , restOrdering        :: String      -- ^ Term ordering for use in REST
   , noStringTheory :: Bool             -- ^ disable interpretation of string theory by SMT
   , explicitKvars  :: Bool             -- ^ use explicitly declared kvars (horn style) which disables several "defensive simplifications"
+  , allowDeepKVars :: Bool             -- ^ accept (and resolve) PKVar refs nested inside expressions; required for pre-eliminated non-cut kvar cube bodies that still mention cut kvars
   , sortedSolution :: Bool             -- ^ leave sorts in the solution
   , saveDir        :: Maybe FilePath    -- ^ output directory for --save generated files (default: .liquid/ next to source)
   } deriving (Eq,Show,Generic)
@@ -257,6 +258,7 @@ defConfig = Config
   , fuel               = Nothing
   , restOrdering       = "rpo"
   , explicitKvars      = False
+  , allowDeepKVars     = False
   , sortedSolution     = False
   }
 
@@ -376,6 +378,8 @@ fxOptions =
       "Ordering constraint algebra to use for REST"
   , opt0 "explicit-kvars"          (\c -> c { explicitKvars  = True })
       "Use explicitly declared kvars (horn style) which disables several defensive simplifications"
+  , opt0 "allow-deep-kvars"        (\c -> c { allowDeepKVars = True })
+      "Accept PKVar refs nested inside expressions (e.g. inside (or (exists ...))) and resolve them during apply. Required for clients that pre-eliminate non-cut kvars and ship cube bodies that still mention cut kvars."
   , opt0 "sorted-solution"         (\c -> c { sortedSolution = True })
       "Leave elaborated sorts in the solution (only for machine consumption)"
   , Option "v" ["verbose"]         (NoArg (FxVerbosity Loud))

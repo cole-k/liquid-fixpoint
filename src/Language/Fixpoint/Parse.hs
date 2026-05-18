@@ -93,9 +93,12 @@ module Language.Fixpoint.Parse (
   -- * Parsing Function
   , doParse'
   , doParse''
+  , doParseWith
   , parseTest'
   , parseFromFile
+  , parseFromFileWith
   , parseFromStdIn
+  , parseFromStdInWith
   , remainderP
 
   -- * Utilities
@@ -231,6 +234,11 @@ data PStateV v = PState { fixityTable :: OpTable v
                      , layoutStack :: LayoutStack
                      , numTyCons   :: !(S.HashSet Symbol)
                      , allowExists :: !Bool
+                      -- | When true, the Horn expression parser ('Horn.Parse.exprP'/'pExprP')
+                      -- accepts kvar references in expression position, e.g. inside
+                      -- @(or (exists ((x t)) (and ... ($k a b c) ...)))@. Required by
+                      -- clients that pre-eliminate non-cut kvars.
+                     , allowDeepKVarsP :: !Bool
                      }
 type PState = PStateV Symbol
 
@@ -1477,6 +1485,7 @@ initPState cmpFun = PState { fixityTable = bops cmpFun
                            , layoutStack = Empty
                            , numTyCons   = S.empty
                            , allowExists = False
+                           , allowDeepKVarsP = False
                            }
 
 -- | Entry point for parsing, for testing.
@@ -1488,8 +1497,13 @@ doParse' :: Parser a -> SourceName -> String -> a
 doParse' = doParse'' False
 
 doParse'' :: Bool -> Parser a -> SourceName -> String -> a
-doParse'' allowEx parser fileName input =
-  case runParser (evalStateT (spaces *> parser <* eof) ((initPState Nothing) { allowExists = allowEx})) fileName input of
+doParse'' allowEx = doParseWith (\s -> s { allowExists = allowEx })
+
+-- | Like 'doParse'' but allows the caller to tweak the initial 'PState'
+-- (e.g. to set 'allowDeepKVarsP').
+doParseWith :: (PState -> PState) -> Parser a -> SourceName -> String -> a
+doParseWith fixState parser fileName input =
+  case runParser (evalStateT (spaces *> parser <* eof) (fixState (initPState Nothing))) fileName input of
     Left peb@(ParseErrorBundle errors posState) -> -- parse errors; we extract the first error from the error bundle
       let
         ((_, pos) :| _, _) = attachSourcePos errorOffset errors posState
@@ -1512,8 +1526,16 @@ parseTest' parser input =
 parseFromFile :: Parser b -> SourceName -> IO b
 parseFromFile p f = doParse' p f <$> readFile f
 
+-- | Like 'parseFromFile' but allows the caller to tweak the initial 'PState'.
+parseFromFileWith :: (PState -> PState) -> Parser b -> SourceName -> IO b
+parseFromFileWith fixState p f = doParseWith fixState p f <$> readFile f
+
 parseFromStdIn :: Parser a -> IO a
 parseFromStdIn p = doParse' p "stdin" . T.unpack <$> T.getContents
+
+-- | Like 'parseFromStdIn' but allows the caller to tweak the initial 'PState'.
+parseFromStdInWith :: (PState -> PState) -> Parser a -> IO a
+parseFromStdInWith fixState p = doParseWith fixState p "stdin" . T.unpack <$> T.getContents
 
 -- | Obtain a fresh integer during the parsing process.
 freshIntP :: ParserV v Integer

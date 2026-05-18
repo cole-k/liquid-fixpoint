@@ -11,7 +11,7 @@ module Language.Fixpoint.Horn.Parse (
   , sortP
 ) where
 
-import qualified Language.Fixpoint.Parse        as FP (Parser, addNumTyCon, lexeme', locLexeme', reserved', reservedOp', symbolR, upperIdR, lowerIdR, stringR, naturalR, mkFTycon, kvarP)
+import qualified Language.Fixpoint.Parse        as FP (Parser, addNumTyCon, lexeme', locLexeme', reserved', reservedOp', symbolR, upperIdR, lowerIdR, stringR, naturalR, mkFTycon, kvarP, allowDeepKVarsP)
 import qualified Language.Fixpoint.Types        as F
 import qualified Language.Fixpoint.Horn.Types   as H
 import           Text.Megaparsec                hiding (State)
@@ -19,6 +19,7 @@ import           Text.Megaparsec.Char           (space1, string, char)
 import qualified Data.HashMap.Strict            as M
 import qualified Data.Text as T
 import qualified Text.Megaparsec.Char.Lexer  as L
+import           Control.Monad.State            (gets)
 
 type FParser = FP.Parser
 
@@ -204,7 +205,87 @@ hPredP = parens body
   where
     body =  H.Var  <$> kvSymP <*> some exprP
         <|> H.PAnd <$> (reserved "and" *> some hPredP)
-        <|> H.Reft <$> exprP
+        <|> H.Reft <$> hPredReftP
+
+-- | The expression body of an @H.Reft@. Normally this is just 'exprP', but
+-- when @--allow-deep-kvars@ is set we additionally accept the @Pred::Hyp@
+-- shape that Flux's non-cut kvar elimination emits at this slot. The exact
+-- on-the-wire grammar (mirroring @lib/liquid-fixpoint/src/format.rs@) is:
+--
+-- @
+--   hyp_expr   ::= cube_expr                            -- singleton
+--                | (or cube_expr cube_expr ...)         -- multi
+--                | false                                -- empty
+--
+--   cube_expr  ::= pred_expr                            -- no binders
+--                | (exists ((b t) ...) pred_expr)       -- with binders
+--
+--   pred_expr  ::= <ordinary expr>
+--                | true
+--                | (and pred_expr pred_expr ...)
+--                | ($k a0 a1 ...)
+--                | hyp_expr                             -- nested
+-- @
+--
+-- The @$k a0 a1 ...@ form is only reachable through this dedicated grammar
+-- — never via the general 'exprP'/'pExprP' — so a kvar reference cannot
+-- appear inside @=>@, @not@, @=@, @if@, an arithmetic operand, the head of
+-- a function application, or any other expression position fixpoint did
+-- not previously accept.
+hPredReftP :: FParser F.Expr
+hPredReftP = do
+  allow <- gets FP.allowDeepKVarsP
+  if allow then try hypExprP <|> exprP
+           else exprP
+
+-- | Parse a 'hyp_expr' (see 'hPredReftP').
+hypExprP :: FParser F.Expr
+hypExprP
+  =   try (parens (reserved "or" >> (F.POr <$> many cubeExprP)))
+  <|> try (sym "false" >> return (F.POr []))
+  <|> cubeExprP
+
+-- | Parse a 'cube_expr' (see 'hPredReftP').
+cubeExprP :: FParser F.Expr
+cubeExprP
+  =   try (parens (reserved "exists" >> (F.PExist <$> bindsP <*> predExprP)))
+  <|> predExprP
+
+-- | Parse a 'pred_expr' (see 'hPredReftP'). Tries the structured kvar/and/
+-- nested-hyp forms first; falls back to an ordinary 'exprP'.
+--
+-- Notably 'predExprP' recursively descends through @(and ...)@, @(or ...)@,
+-- and @(exists ((...)) ...)@ subforms, since cube bodies can be arbitrarily
+-- nested. The fall-through to 'exprP' handles all other expression shapes
+-- (atoms, function applications, etc.) and is the only path that does NOT
+-- allow buried kvar references — that exclusion is by design (cf. the
+-- Flux 'Pred::Hyp' emitter in @lib\/liquid-fixpoint\/src\/format.rs@).
+predExprP :: FParser F.Expr
+predExprP
+  =   try (parens kvarExprP)
+  <|> try (parens (reserved "and"    >> (F.PAnd   <$> many predExprP)))
+  <|> try (parens (reserved "or"     >> (F.POr    <$> many cubeExprP)))
+  <|> try (parens (reserved "exists" >> (F.PExist <$> bindsP <*> predExprP)))
+  <|> exprP
+
+-- | Parse a kvar reference @$k a1 a2 ...@.
+--
+-- Builds the same @F.PKVar@ shape as 'kvApp' in "Language.Fixpoint.Horn.Info":
+-- positional arguments become a substitution
+-- @[hvarArgSymbol k 0 := a0, hvarArgSymbol k 1 := a1, ...]@. This matches the
+-- naming convention used by Horn 'wfc' generation, so elaboration finds the
+-- expected parameter binders in scope.
+--
+-- Only reachable from 'predExprP' (which is itself only reached via
+-- 'hPredReftP' under @--allow-deep-kvars@), so a kvar reference cannot
+-- appear in any expression position fixpoint did not previously accept.
+kvarExprP :: FParser F.Expr
+kvarExprP = do
+  k    <- kvSymP
+  args <- many exprP
+  let paramSyms = [F.hvarArgSymbol k i | i <- [0 .. length args - 1]]
+      su        = F.mkKVarSubst (zip paramSyms args)
+  return $ F.PKVar (F.KV k) mempty su
 
 kvSymP :: FParser F.Symbol
 kvSymP = char '$' *> symbolP

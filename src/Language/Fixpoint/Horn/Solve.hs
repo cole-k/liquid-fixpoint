@@ -46,12 +46,13 @@ solveHorn baseCfg0 = do
 
 parseQuery :: F.Config -> IO H.TagQuery
 parseQuery cfg
-  | F.stdin cfg = Parse.parseFromStdIn H.hornP
+  | F.stdin cfg = Parse.parseFromStdInWith fixState H.hornP
   | json        = loadFromJSON file
-  | otherwise   = Parse.parseFromFile H.hornP file
+  | otherwise   = Parse.parseFromFileWith fixState H.hornP file
   where
-    json  = Files.isExtFile Files.Json file
-    file  = F.srcFile cfg
+    json     = Files.isExtFile Files.Json file
+    file     = F.srcFile cfg
+    fixState s = s { Parse.allowDeepKVarsP = F.allowDeepKVars cfg }
 
 loadFromJSON :: FilePath -> IO H.TagQuery
 loadFromJSON f = do
