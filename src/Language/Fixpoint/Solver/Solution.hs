@@ -312,8 +312,71 @@ apply cfg g s bs =
     -- variables with quantifiers.
     let xrs = map (lookupBindEnvExt g) (F.elemsIBindEnv bs)
         (ps,  ks) = envConcKVars xrs
-        (pks, kI) = applyKVars cfg g {ceBindingsInSmt = F.emptyIBindEnv} s ks
-     in (F.conj (pks:ps), kI)   -- see [NOTE: pAnd-SLOW]
+        g'        = g {ceBindingsInSmt = F.emptyIBindEnv}
+        (pks, kI) = applyKVars cfg g' s ks
+        -- Resolve any kvar refs buried inside the "concrete" preds.
+        -- Normally @ps@ contains no @PKVar@ nodes (the invariant established
+        -- by @sortedReftConcKVars@, which only splits top-level conjuncts),
+        -- but pre-eliminated non-cut kvar cube bodies can contain cut-kvar
+        -- refs inside @(or (exists ...))@. Sweep those here so SMT
+        -- serialization never sees a raw @PKVar@. Gated on
+        -- @--allow-deep-kvars@ to preserve the legacy invariant by default.
+        (ps', kIs)
+          | allowDeepKVars cfg = unzip (map (resolveBuriedKVars cfg g' s) ps)
+          | otherwise          = (ps, [])
+     in (F.conj (pks:ps'), mconcat (kI : kIs))   -- see [NOTE: pAnd-SLOW]
+
+-- | Walk an @Expr@ and replace every @PKVar k tsu su@ node with the result of
+-- @applyKVar@ on the equivalent @KVSub@. This is a no-op for expressions that
+-- contain no buried kvar references (the common case).
+resolveBuriedKVars
+  :: Config -> CombinedEnv ann -> Sol.Sol Sol.QBind -> F.Expr -> ExprInfo
+resolveBuriedKVars cfg g s = go
+  where
+    go e0 = case e0 of
+      F.PKVar k tsu su ->
+        let ksu = F.KVS F.dummySymbol F.FInt k su tsu
+            (e', kI) = applyKVar cfg g s ksu
+        -- The substituted expression itself may contain further PKVars
+        -- (e.g. a non-cut kvar that inlined to cubes mentioning cut
+        -- kvars). Recurse.
+         in let (e'', kI') = go e' in (e'', kI <> kI')
+      F.EApp e1 e2     -> bin F.EApp e1 e2
+      F.ENeg e         -> uni F.ENeg e
+      F.EBin op e1 e2  -> bin (F.EBin op) e1 e2
+      F.EIte e1 e2 e3  -> tri F.EIte e1 e2 e3
+      F.ECst e t       -> uni (`F.ECst` t) e
+      F.ELam b e       -> uni (F.ELam b) e
+      F.ETApp e t      -> uni (`F.ETApp` t) e
+      F.ETAbs e x      -> uni (`F.ETAbs` x) e
+      F.PAnd ps        -> mapMany F.PAnd ps
+      F.POr  ps        -> mapMany F.POr  ps
+      F.PNot e         -> uni F.PNot e
+      F.PImp e1 e2     -> bin F.PImp e1 e2
+      F.PIff e1 e2     -> bin F.PIff e1 e2
+      F.PAtom r e1 e2  -> bin (F.PAtom r) e1 e2
+      F.PAll  xts e    -> uni (F.PAll  xts) e
+      F.PExist xts e   -> uni (F.PExist xts) e
+      F.ECoerc t t' e  -> uni (F.ECoerc t t') e
+      F.ELet x e1 e2   -> bin (F.ELet x) e1 e2
+      -- Leaves: nothing to descend into.
+      F.ESym _         -> (e0, mempty)
+      F.ECon _         -> (e0, mempty)
+      F.EVar _         -> (e0, mempty)
+
+    uni f e = let (e', kI) = go e in (f e', kI)
+    bin f e1 e2 =
+      let (e1', kI1) = go e1
+          (e2', kI2) = go e2
+       in (f e1' e2', kI1 <> kI2)
+    tri f e1 e2 e3 =
+      let (e1', kI1) = go e1
+          (e2', kI2) = go e2
+          (e3', kI3) = go e3
+       in (f e1' e2' e3', kI1 <> kI2 <> kI3)
+    mapMany f es =
+      let (es', kIs) = unzip (map go es)
+       in (f es', mconcat kIs)
 
 -- | @applyInSortedReft@ applies the solution to a single sorted reft
 applyInSortedReft
@@ -324,8 +387,12 @@ applyInSortedReft
   -> (F.Symbol, F.SortedReft)
 applyInSortedReft cfg g s xsr@(x, sr) =
     let (ps,  ks) = envConcKVars [xsr]
-        (pks, _) = applyKVars cfg g {ceBindingsInSmt = F.emptyIBindEnv} s ks
-     in (x, sr { F.sr_reft = F.Reft (x, F.conj (pks : ps)) })
+        g'        = g {ceBindingsInSmt = F.emptyIBindEnv}
+        (pks, _)  = applyKVars cfg g' s ks
+        ps'
+          | allowDeepKVars cfg = map (fst . resolveBuriedKVars cfg g' s) ps
+          | otherwise          = ps
+     in (x, sr { F.sr_reft = F.Reft (x, F.conj (pks : ps')) })
 
 -- | Produces conjuncts of each sorted reft in the IBindEnv, separated
 -- into concrete conjuncts and kvars.
