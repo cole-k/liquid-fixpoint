@@ -60,14 +60,20 @@ solveWVars cfg scope fi sFinal = do
   -- The non-vacuity checks below are quantified; MBQI must be on for the
   -- solver to decide them (the preamble disables it for the QF Phase-1 checks).
   smtEnablembqi
-  -- one WP conjunct per (w-var, drop); keep only non-vacuous ones
-  perDrop <- filterM nonVacuous
-               [ (w, wpOfDrop w d) | d <- drops, w <- wdWVars d ]
+  -- The same drop is recorded on every fixpoint iteration; dedup first (cheap,
+  -- on the provenance) before building/checking WPs.
+  let uniqueDrops = M.elems $ M.fromList [ (dropKey d, d) | d <- drops ]
+      cands = [ (w, wpOfDrop w d) | d <- uniqueDrops, w <- wdWVars d ]
+  perDrop <- filterM nonVacuous cands
   let perWVar = M.fromListWith (++) [ (w, [e]) | (w, (e, _)) <- perDrop ]
   return $ M.map mkFix perWVar
   where
     be = F.bs fi
     cm = F.cm fi
+
+    -- cheap identity of a drop for deduplication
+    dropKey :: WDrop -> (F.SubcId, F.KVar, F.Expr)
+    dropKey d = (wdCid d, wdKVar d, wdHead d)
 
     mkFix :: [F.Expr] -> F.WVarFix
     mkFix conjs =
