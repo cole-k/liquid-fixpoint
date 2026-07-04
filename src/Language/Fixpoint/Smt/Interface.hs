@@ -45,6 +45,7 @@ module Language.Fixpoint.Smt.Interface (
     , qeWith
     , qeTactic
     , qeMany
+    , qeManyD
 
     -- * Query API
     , smtDecl
@@ -250,10 +251,16 @@ qeTactic = "(then qe ctx-solver-simplify)"
 -- | A variant of 'qe' where the caller supplies the Z3 apply-tactic text, e.g.
 --   @"qe"@, @"(then qe simplify)"@, or @"(then qe ctx-solver-simplify)"@.
 qeWith :: T.Text -> Expr -> SmtM Expr
-qeWith tactic e =
+qeWith = qeWith' True
+
+-- | @qeWith' declareFree tactic e@. If @declareFree@ is 'True' (the standalone
+--   case) the free symbols of @e@ are declared first; if 'False' the caller has
+--   already declared everything (e.g. via a full 'SymEnv', which also registers
+--   datatypes so that Z3's QE can reason about ADT selectors).
+qeWith' :: Bool -> T.Text -> Expr -> SmtM Expr
+qeWith' declareFree tactic e =
   smtBracket "qe" $ do
-    -- declare the free variables / function symbols of `e`
-    mapM_ (uncurry smtDecl) (freeSymbolSorts e)
+    when declareFree $ mapM_ (uncurry smtDecl) (freeSymbolSorts e)
     -- assert the (possibly quantified) formula ...
     smtAssertDecl e
     -- ... and ask Z3 to eliminate quantifiers + simplify
@@ -263,6 +270,19 @@ qeWith tactic e =
       Right e' -> pure e'
       Left perr -> die $ err dummySpan $ text
                     ("qe: could not parse Z3 output:\n" ++ T.unpack out ++ "\nparse error: " ++ perr)
+
+-- | Like 'qeMany', but the fresh context is populated from a full 'SymEnv' (and
+--   'DefinedFuns'), so datatypes/uninterpreted symbols are declared properly and
+--   Z3's QE can reason about ADT selectors. 'qe' does /not/ self-declare here
+--   (everything is already declared), avoiding "already declared" conflicts.
+qeManyD :: Config -> SymEnv -> DefinedFuns -> [Expr] -> IO [Expr]
+qeManyD cfg env defns es = mapM one es
+  where
+    one :: Expr -> IO Expr
+    one e =
+      (bracket (makeContextWithSEnv cfg "" env defns) cleanupContext $ \ctx ->
+         evalStateT (qeWith' False qeTactic e) ctx)
+      `catch` \(_ :: SomeException) -> pure e
 
 -- | Run 'qe' on several formulas in a /fresh, isolated/ SMT context.
 --

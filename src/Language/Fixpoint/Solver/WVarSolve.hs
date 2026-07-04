@@ -42,7 +42,8 @@ import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
 import qualified Language.Fixpoint.Types.Visitor    as V
 import           Language.Fixpoint.Solver.Monad     (SolveM, WDrop(..), getWDrops, filterValid, smtEnablembqi)
-import           Language.Fixpoint.Smt.Interface    (qeMany)
+import           Language.Fixpoint.Smt.Interface    (qeManyD)
+import           Language.Fixpoint.Solver.Sanitize  (symbolEnv)
 import qualified Language.Fixpoint.Solver.Solution  as So
 
 -- | A reclaimed qualifier: a k-var and one of its (formal-param) qualifiers.
@@ -90,7 +91,7 @@ solveWVars cfg scope fi sFinal failCs = do
   -- Simplify each WP conjunct with QE (fresh context; best-effort).
   let ws0 = map fst cands
       es0 = map snd cands
-  es1 <- liftIO $ qeMany cfg es0
+  es1 <- liftIO $ qeManyD cfg (symbolEnv cfg fi) (F.defns fi) es0
   let perWVar = M.fromListWith (++) [ (w, [e]) | (w, e) <- zip ws0 es1 ]
   return $ M.map mkFix perWVar
   where
@@ -155,18 +156,18 @@ solveWVars cfg scope fi sFinal failCs = do
       | otherwise           = do
           let (wp, dom) = mkWP w c' lhs qHead
           -- Non-vacuity is decided by eliminating the WP's quantifier (QE) and a
-          -- cheap quantifier-free satisfiability check. For WPs over uninterpreted
-          -- functions QE is both slow and usually cannot eliminate the
-          -- quantifier, so we skip it and conservatively keep the saver (whether
-          -- the solution really fixes a head is re-checked at report time).
-          if hasApp wp then return True else do
-            wp' <- liftIO (qe1 wp)
-            if hasQuant wp' then return True
-                            else satisfiable (F.pAnd [wp', dom])
+          -- cheap quantifier-free satisfiability check. QE runs in a datatype-
+          -- aware context, so ADT selectors are fine. If QE still cannot
+          -- eliminate the quantifier (e.g. genuinely uninterpreted functions),
+          -- conservatively keep the saver -- whether the solution really fixes a
+          -- head is re-checked at report time.
+          wp' <- liftIO (qe1 wp)
+          if hasQuant wp' then return True
+                          else satisfiable (F.pAnd [wp', dom])
 
     -- QE a single formula (fresh Z3 context); returns it unchanged on failure.
     qe1 :: F.Expr -> IO F.Expr
-    qe1 e = do es <- qeMany cfg [e]
+    qe1 e = do es <- qeManyD cfg (symbolEnv cfg fi) (F.defns fi) [e]
                return (case es of (x:_) -> x; [] -> e)
 
     guards :: F.WVar -> F.SimpC a -> Bool
@@ -318,9 +319,6 @@ rhsKSubs _                   = []
 hasQuant :: F.Expr -> Bool
 hasQuant = anyExpr q where q (F.PAll _ _) = True; q (F.PExist _ _) = True; q _ = False
 
--- | Does the expression contain a (non-nullary) function application?
-hasApp :: F.Expr -> Bool
-hasApp = anyExpr q where q (F.EApp _ _) = True; q _ = False
 
 -- | Is the predicate @p@ true of the expression or any subexpression?
 anyExpr :: (F.Expr -> Bool) -> F.Expr -> Bool
