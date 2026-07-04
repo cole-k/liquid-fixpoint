@@ -84,6 +84,7 @@ resultExitCode :: (Fixpoint a, NFData a, ToJSON a) => Config -> Result a
 ---------------------------------------------------------------------------
 resultExitCode cfg r = do
   whenNormal $ colorStrLn (colorResult stat) (statStr $!! stat)
+  when (wvars cfg) $ whenNormal $ printWVarFixes (resWVars r)
   when (json cfg) $ LT.putStrLn jStr
   return (eCode r)
   where
@@ -91,6 +92,20 @@ resultExitCode cfg r = do
     stat    = resStatus $!! r
     eCode   = resultExit . resStatus
     statStr = PJ.render . resultDoc
+
+-- | Human-readable dump of the diagnostic w-var fixes (rescued qualifiers +
+-- responsible w-vars, per failing head). Verdict is unchanged; this is purely
+-- informational.
+printWVarFixes :: WVarResult -> IO ()
+printWVarFixes wres
+  | HashMap.null wres = return ()
+  | otherwise         = do
+      colorStrLn Loud "\nW-var rescue candidates (diagnostic; verdict unchanged):"
+      mapM_ pp (HashMap.toList wres)
+  where
+    pp (i, fixes) = do
+      colorStrLn Loud ("  constraint " ++ show i ++ ":")
+      mapM_ (colorStrLn Loud . ("    - " ++) . PJ.render . pprint) fixes
 
 ignoreQualifiers :: Config -> FInfo a -> FInfo a
 ignoreQualifiers cfg fi

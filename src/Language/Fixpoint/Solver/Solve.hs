@@ -28,6 +28,7 @@ import qualified Language.Fixpoint.Smt.Types as T
 import qualified Language.Fixpoint.Solver.Worklist  as W
 import qualified Language.Fixpoint.Solver.Eliminate as E
 import qualified Language.Fixpoint.Solver.WVar      as WVar
+import qualified Language.Fixpoint.Solver.WVarSolve as WVarSolve
 import           Language.Fixpoint.Solver.Monad
 import           Language.Fixpoint.Utils.Progress
 import           Language.Fixpoint.Graph
@@ -179,9 +180,18 @@ solve_ cfg scope fi s2 wkl = do
         result scope bindingsInSmt cfg fi2 badsCs2 s3
     _ -> return $ mytrace "all checked with interpreter" res1
 
+  -- w-var rescue analysis: only when --wvars is on and we ended up Unsafe.
+  res2' <- case (wvars cfg, resStatus res2) of
+    (True, Unsafe _ bads) -> do
+      liftSMT $ smtComment "solve: wvar-rescue"
+      wres <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bik ->
+                WVarSolve.rescueWVars cfg scope bik fi s2 s3 (map fst bads)
+      return res2 { F.resWVars = wres }
+    _ -> return res2
+
   liftSMT $ smtComment "solve: finished"
   st      <- stats
-  let res3 = {- SCC "sol-tidy" -} tidyResult cfg res2
+  let res3 = {- SCC "sol-tidy" -} tidyResult cfg res2'
   return $!! (res3, st)
 
 

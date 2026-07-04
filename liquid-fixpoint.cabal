@@ -94,6 +94,7 @@ library
                     Language.Fixpoint.Solver.Stats
                     Language.Fixpoint.Solver.TrivialSort
                     Language.Fixpoint.Solver.WVar
+                    Language.Fixpoint.Solver.WVarSolve
                     Language.Fixpoint.Solver.UniqifyBinds
                     Language.Fixpoint.Solver.UniqifyKVars
                     Language.Fixpoint.Solver.Worklist
