@@ -295,23 +295,29 @@ refineC wVs scope bindingsInSmt be _i s c =
           let lhs = S.lhsPred cfg scope bindingsInSmt be s c
           kqs <- forM krhs $ \(k, rhs) -> do
             kept <- filterValid (cstrSpan c) lhs rhs
-            captureWDrops cfg k rhs kept
+            captureWDrops cfg lhs k rhs kept
             return (k, Sol.QB kept)
           return $ S.update s kqs
   where
     -- On the fly: when this (w-guarded) constraint drops candidate qualifiers
-    -- from a k-var head, record each dropped qualifier (already instantiated at
-    -- the head args) together with the guarding w-var(s). This is exactly the
-    -- provenance needed to build the w-var's weakest-precondition later: the
-    -- responsible constraint is *this* one, no post-hoc search required.
-    captureWDrops cfg k rhs kept
+    -- from a k-var head, record each dropped qualifier (instantiated at the head
+    -- args) together with the guarding w-var(s). The responsible constraint is
+    -- *this* one, so no post-hoc search is needed to build the w-var's WP later.
+    --
+    -- We skip qualifiers that are *vacuous* at this constraint: if @lhs /\ Q@ is
+    -- unsatisfiable (i.e. @lhs => not Q@), then Q contradicts the body even with
+    -- the w-var at its weakest (true). Strengthening the w-var only shrinks the
+    -- guard, so it can never rescue such a Q -- there is no point tracking it.
+    captureWDrops cfg lhs k rhs kept
       | not (wvars cfg) = return ()
       | null guardWs    = return ()
-      | otherwise       =
-          recordWDrops
-            [ WDrop guardWs (F.subcId c) k qPred eq
-            | (qPred, eq) <- rhs, eq `notElem` kept ]
+      | otherwise       = do
+          drops <- fmap concat $ forM dropped $ \(qPred, eq) -> do
+                     vac <- isValid (cstrSpan c) lhs (F.PNot qPred)  -- lhs => not Q  ==  lhs /\ Q unsat
+                     return [ WDrop guardWs (F.subcId c) k qPred eq | not vac ]
+          recordWDrops drops
       where
+        dropped = [ (qPred, eq) | (qPred, eq) <- rhs, eq `notElem` kept ]
         guardWs = [ F.kvarWVar wk
                   | wk <- L.nub (V.envKVars be c)
                   , S.member (F.kvarWVar wk) wVs ]

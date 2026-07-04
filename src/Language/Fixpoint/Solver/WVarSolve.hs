@@ -35,6 +35,8 @@ import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
 import           Control.Monad                      (filterM)
 import           Control.Monad.IO.Class             (liftIO)
+import           Data.Ord                           (comparing)
+import           Data.Hashable                      (Hashable)
 -- import qualified Debug.Trace                     as Debug  -- for [WVAR-PERF] instrumentation
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
@@ -48,13 +50,23 @@ import qualified Language.Fixpoint.Solver.Solution  as So
 -- | Build candidate w-var solutions from the drops captured during Phase 1.
 --   Runs inside 'SolveM' (after refinement).
 --
---   A captured drop is only turned into a WP if it is /relevant/: re-adding the
---   dropped qualifier to its k-var must actually help prove one of the failing
---   heads. This discards drops from constraints (e.g. base cases) whose
---   qualifiers have nothing to do with the failure -- otherwise every w-var that
---   happens to guard such a constraint would be reported with a useless (but
---   satisfiable) "solution". Surviving conjuncts are additionally checked for
---   non-vacuity (satisfiability with the domain) and simplified with QE.
+--   Algorithm (per failing head @h@):
+--
+--     1. Gather every reclaimed qualifier from a w-guarded drop whose k-var
+--        appears in @h@'s LHS. (Vacuous qualifiers -- ones that contradict their
+--        own constraint's body -- were already discarded at drop time, so no
+--        w-var could rescue them.)
+--     2. Re-add *all* of them to their k-vars and check the conjunction proves
+--        @h@. If not, @h@ cannot be fixed by these w-vars; skip it.
+--     3. Minimize: greedily drop qualifiers while @h@ still proves, leaving a
+--        minimal load-bearing subset that (together) validates @h@.
+--     4. For each surviving qualifier, build the weakest precondition on its
+--        responsible w-var. Group per w-var (a w-var responsible for several
+--        gets the conjunction), then simplify with QE.
+--
+--   The minimization over the *conjunction* is what lets a fix that needs
+--   several cooperating qualifiers/w-vars be found -- not just single-qualifier
+--   rescues.
 --------------------------------------------------------------------------------
 solveWVars
   :: forall a. (F.Loc a)
@@ -66,41 +78,114 @@ solveWVars
   -> SolveM a F.WVarResult
 solveWVars cfg scope fi sFinal failCs = do
   drops <- getWDrops
-  -- The non-vacuity checks below are quantified; MBQI must be on for the
-  -- solver to decide them (the preamble disables it for the QF Phase-1 checks).
+  -- The WP non-vacuity/QE below is quantified; MBQI must be on (the preamble
+  -- disables it for the QF Phase-1 checks).
   smtEnablembqi
-  -- The same drop is recorded on every fixpoint iteration; dedup first (cheap,
-  -- on the provenance) before building/checking WPs.
+  -- The same drop is recorded on every fixpoint iteration; dedup.
   let uniqueDrops = M.elems $ M.fromList [ (dropKey d, d) | d <- drops ]
-  -- Keep only drops whose qualifier actually helps rescue a failing head.
-  relDrops <- filterM relevant uniqueDrops
-  let cands = [ (w, wpOfDrop w d) | d <- relDrops, w <- wdWVars d ]
-  perDrop <- filterM nonVacuous cands
-  -- Simplify each surviving WP conjunct with Z3 quantifier elimination, in a
-  -- FRESH context (qeMany) so `(apply qe)` does not see the main solver's
-  -- ambient assertions. Best-effort: a formula QE can't handle is returned
-  -- unchanged.
-  let ws0  = map fst perDrop
-      es0  = map (fst . snd) perDrop
+  -- For each failing head, find a minimal set of reclaimed qualifiers that
+  -- together prove it; keep the union of those load-bearing drops.
+  coreDrops <- concat <$> mapM (loadBearing uniqueDrops) failCs
+  -- Build per-drop WP conjuncts, attributing each drop to the /best-covering/
+  -- guarding w-var (the one whose arguments mention the most of the variables
+  -- the qualifier constrains). When several w-vars guard a constraint, a
+  -- qualifier can often be provided by any of them, but the best-covering one
+  -- gives the least degenerate solution; picking it avoids reporting the same
+  -- qualifier as a separate (often vacuous) "fix" on every ambient w-var.
+  -- Keep only non-vacuous conjuncts (satisfiable with the constraint domain).
+  let cands0 = L.nub [ (w, wpOfDrop w d) | d <- coreDrops, Just w <- [bestWVar d] ]
+  cands <- filterM (\(_, (wp, lhs)) -> satisfiable (F.pAnd [wp, lhs])) cands0
+  -- Simplify each WP conjunct with Z3 quantifier elimination, in a FRESH
+  -- context (qeMany) so `(apply qe)` does not see the solver's ambient
+  -- assertions. Best-effort: a formula QE can't handle is returned unchanged.
+  let ws0   = map fst cands
+      es0   = map (fst . snd) cands
+      lhss0 = map (snd . snd) cands
   es1 <- liftIO $ qeMany cfg es0
-  let perWVar = M.fromListWith (++) [ (w, [e]) | (w, e) <- zip ws0 es1 ]
-  return $ M.map mkFix perWVar
+  -- group per w-var, carrying each conjunct's QE'd WP and its domain (lhs)
+  let perWVar = M.fromListWith (++) [ (w, [(e, l)]) | (w, e, l) <- zip3 ws0 es1 lhss0 ]
+  -- Final vacuity guard (domain-aware): a w-var's *combined* solution must be
+  -- satisfiable together with the domains its conjuncts came from. This rejects
+  -- bundles whose conjuncts contradict each other on the reachable domain
+  -- (e.g. i0>0 AND i0<=0), which are not real fixes.
+  perWVar' <- filterMapM
+                (\els -> satisfiable (F.pAnd (map fst els ++ map snd els)))
+                perWVar
+  return $ M.map (mkFix . map fst) perWVar'
   where
     be = F.bs fi
     cm = F.cm fi
 
-    -- | Is this drop relevant to some failing head? I.e. does re-adding the
-    --   dropped qualifier to its k-var make a failing head (that reads that
-    --   k-var) valid, when it was not before?
-    relevant :: WDrop -> SolveM a Bool
-    relevant d = anyM (rescues d) [ c | c <- failCs, wdKVar d `elem` V.envKVars be c ]
+    -- | Keep only the map entries whose value list satisfies the predicate.
+    filterMapM :: (Eq k, Hashable k, Monad m)
+               => ([v] -> m Bool) -> M.HashMap k [v] -> m (M.HashMap k [v])
+    filterMapM p m = M.fromList <$> filterM (p . snd) (M.toList m)
 
-    rescues :: WDrop -> F.SimpC a -> SolveM a Bool
-    rescues d c = do
-      let sEnh = addEQual (wdKVar d) (wdEQual d) sFinal
-          lhs  = So.lhsPred cfg scope F.emptyIBindEnv be sEnh c
-          rhs  = F.crhs c
-      isValid (F.srcSpan (F.sinfo c)) lhs rhs
+    -- | For a single failing constraint @c@: a small set of reclaimed qualifiers
+    --   that, re-added to their k-vars, makes @c@ valid /non-vacuously/. We build
+    --   the set up greedily: start from nothing and add a candidate only if it
+    --   keeps the enhanced LHS satisfiable (adding contradictory qualifiers would
+    --   make the k-var false and "prove" the head trivially); stop once the head
+    --   holds. Empty if the head can't be rescued this way.
+    loadBearing :: [WDrop] -> F.SimpC a -> SolveM a [WDrop]
+    loadBearing ds c = grow c [] cand
+      where
+        lhsKs = V.envKVars be c
+        cand  = L.sortOn coverGap [ d | d <- ds, wdKVar d `elem` lhsKs ]
+
+    -- | Grow a consistent, load-bearing set. @acc@ (kept LHS-satisfiable) is the
+    --   set so far; try each remaining candidate, keeping only those that
+    --   preserve satisfiability, and stop as soon as the head holds.
+    grow :: F.SimpC a -> [WDrop] -> [WDrop] -> SolveM a [WDrop]
+    grow c acc rest = do
+      done <- headHolds c acc
+      if done then return acc else go rest
+      where
+        go []      = return []             -- couldn't rescue the head
+        go (d:ds') = do
+          keepSat <- lhsSat c (acc ++ [d])
+          if keepSat then do r <- grow c (acc ++ [d]) ds'
+                             if null r then go ds' else return r
+                     else go ds'
+
+    -- | Is the enhanced LHS (k-vars augmented by @ds@) satisfiable?
+    lhsSat :: F.SimpC a -> [WDrop] -> SolveM a Bool
+    lhsSat c ds = satisfiable (So.lhsPred cfg scope F.emptyIBindEnv be (enhance ds) c)
+
+    -- | The final solution with every drop in @ds@ re-added to its k-var.
+    enhance :: [WDrop] -> Sol.Solution
+    enhance = foldr (\d -> addEQual (wdKVar d) (wdEQual d)) sFinal
+
+    -- | How many variables of the dropped qualifier are NOT covered by (the best
+    --   of) its guarding w-vars' arguments. 0 = some w-var sees every variable
+    --   the qualifier constrains (a clean fix); larger = more degenerate.
+    coverGap :: WDrop -> Int
+    coverGap d =
+      let qvs = F.exprSymbolsSet (wdHead d)
+          wargs w = maybe mempty (wvarArgSyms w) (M.lookup (wdCid d) cm)
+          gap w = S.size (qvs `S.difference` wargs w)
+      in  case wdWVars d of
+            [] -> S.size qvs
+            ws -> minimum (map gap ws)
+
+    -- | The best-covering guarding w-var for a drop: the one whose arguments
+    --   mention the most of the qualifier's variables.
+    bestWVar :: WDrop -> Maybe F.WVar
+    bestWVar d =
+      let qvs = F.exprSymbolsSet (wdHead d)
+          wargs w = maybe mempty (wvarArgSyms w) (M.lookup (wdCid d) cm)
+          gap w = S.size (qvs `S.difference` wargs w)
+      in  case wdWVars d of
+            [] -> Nothing
+            ws -> Just (L.minimumBy (comparing gap) ws)
+
+    -- | Does @c@'s head hold under the enhancement by @ds@? (Callers keep the
+    --   enhanced LHS satisfiable, so this is a genuine, non-vacuous check.)
+    headHolds :: F.SimpC a -> [WDrop] -> SolveM a Bool
+    headHolds c ds =
+      isValid (F.srcSpan (F.sinfo c))
+              (So.lhsPred cfg scope F.emptyIBindEnv be (enhance ds) c)
+              (F.crhs c)
 
     -- | Add an EQual to a k-var's QBind in the solution.
     addEQual :: F.KVar -> Sol.EQual -> Sol.Solution -> Sol.Solution
@@ -110,9 +195,12 @@ solveWVars cfg scope fi sFinal failCs = do
     isValid :: F.SrcSpan -> F.Expr -> F.Expr -> SolveM a Bool
     isValid sp p q = not . null <$> filterValid sp p [(q, ())]
 
-    anyM :: Monad m => (b -> m Bool) -> [b] -> m Bool
-    anyM _ []     = return False
-    anyM f (x:xs) = do b <- f x; if b then return True else anyM f xs
+    -- | @phi@ is satisfiable  <=>  @phi => false@ is NOT valid. Assert @phi@ as
+    --   the LHS so its free variables get declared to the solver.
+    satisfiable :: F.Expr -> SolveM a Bool
+    satisfiable phi = do
+      valid <- not . null <$> filterValid F.dummySpan phi [(F.PFalse, ())]
+      return (not valid)
 
     -- cheap identity of a drop for deduplication
     dropKey :: WDrop -> (F.SubcId, F.KVar, F.Expr)
@@ -123,31 +211,12 @@ solveWVars cfg scope fi sFinal failCs = do
       F.WVarFix { F.wfSolution = F.pAnd (L.nub conjs)
                 , F.wfDrops    = L.nub conjs }
 
-    -- | A WP conjunct is useful iff, conjoined with the constraint's LHS
-    --   (the reachable domain), it is satisfiable. Otherwise the only way to
-    --   satisfy the WP is to make the w-var's guard false on the whole reachable
-    --   domain -- i.e. a vacuous "fix" -- so we reject it. This is what filters
-    --   out an ambient w-var (e.g. one guarding the whole constraint whose args
-    --   don't mention the variable being constrained).
-    nonVacuous :: (F.WVar, (F.Expr, F.Expr)) -> SolveM a Bool
-    nonVacuous (_, (phi, lhs)) = satisfiable (F.pAnd [phi, lhs])
-
-    -- | @phi@ is satisfiable  <=>  @phi => false@ is NOT valid. We assert @phi@
-    --   itself as the LHS so its free variables get declared to the solver.
-    satisfiable :: F.Expr -> SolveM a Bool
-    satisfiable phi = do
-      valid <- not . null <$> filterValid F.dummySpan phi [(F.PFalse, ())]
-      return (not valid)
-
     -- | The WP conjunct for a single recorded drop, /for a specific w-var/:
     --   only that w-var's own arguments are kept free; every other variable in
-    --   the LHS is universally quantified. Returns the conjunct and the LHS
-    --   context (used for the non-vacuity check).
+    --   the LHS is universally quantified.
     --
     --   The quantified variables are alpha-renamed to fresh names so they can
-    --   never collide with the w-var's (free) argument variables -- including in
-    --   the non-vacuity check, where the raw LHS (with those variables free) is
-    --   conjoined with the quantified WP.
+    --   never collide with the w-var's (free) argument variables.
     wpOfDrop :: F.WVar -> WDrop -> (F.Expr, F.Expr)
     wpOfDrop w (WDrop _ cid _ qHead _) =
       case M.lookup cid cm of
