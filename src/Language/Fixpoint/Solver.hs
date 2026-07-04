@@ -93,19 +93,18 @@ resultExitCode cfg r = do
     eCode   = resultExit . resStatus
     statStr = PJ.render . resultDoc
 
--- | Human-readable dump of the diagnostic w-var fixes (rescued qualifiers +
--- responsible w-vars, per failing head). Verdict is unchanged; this is purely
--- informational.
+-- | Human-readable dump of the candidate w-var solutions (WPs). Verdict is
+-- unchanged; this is purely informational.
 printWVarFixes :: WVarResult -> IO ()
 printWVarFixes wres
   | HashMap.null wres = return ()
   | otherwise         = do
-      colorStrLn Loud "\nW-var rescue candidates (diagnostic; verdict unchanged):"
+      colorStrLn Loud "\nW-var candidate solutions (diagnostic; verdict unchanged):"
       mapM_ pp (HashMap.toList wres)
   where
-    pp (i, fixes) = do
-      colorStrLn Loud ("  constraint " ++ show i ++ ":")
-      mapM_ (colorStrLn Loud . ("    - " ++) . PJ.render . pprint) fixes
+    pp (w, fx) = do
+      colorStrLn Loud ("  " ++ show w ++ " :=")
+      colorStrLn Loud ("    " ++ PJ.render (pprint fx))
 
 ignoreQualifiers :: Config -> FInfo a -> FInfo a
 ignoreQualifiers cfg fi

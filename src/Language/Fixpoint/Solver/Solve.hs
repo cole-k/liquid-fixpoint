@@ -18,6 +18,7 @@ import           Control.Monad.Reader
 import           Language.Fixpoint.Misc
 import qualified Language.Fixpoint.Misc            as Misc
 import qualified Language.Fixpoint.Types           as F
+import qualified Language.Fixpoint.Types.Visitor   as V
 import qualified Language.Fixpoint.Types.Solutions as Sol
 import           Language.Fixpoint.Types.PrettyPrint
 import           Language.Fixpoint.Types.Config hiding (stats)
@@ -151,7 +152,7 @@ solve_ cfg scope fi s2 wkl = do
   liftSMT $ smtComment "solve: start"
   (s3, res0) <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bindingsInSmt -> do
     -- let s3   = solveEbinds fi s2
-    s3       <- {- SCC "sol-refine" -} refine scope bindingsInSmt (F.bs fi) s2 wkl
+    s3       <- {- SCC "sol-refine" -} refine (F.wVars fi) scope bindingsInSmt (F.bs fi) s2 wkl
     res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg fi (W.unsatCandidates wkl) s3
     return (s3, res0)
 
@@ -180,12 +181,12 @@ solve_ cfg scope fi s2 wkl = do
         result scope bindingsInSmt cfg fi2 badsCs2 s3
     _ -> return $ mytrace "all checked with interpreter" res1
 
-  -- w-var rescue analysis: only when --wvars is on and we ended up Unsafe.
+  -- w-var solving: only when --wvars is on and we ended up Unsafe. Builds
+  -- candidate w-var solutions (WPs) from the drops captured during Phase 1.
   res2' <- case (wvars cfg, resStatus res2) of
-    (True, Unsafe _ bads) -> do
-      liftSMT $ smtComment "solve: wvar-rescue"
-      wres <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bik ->
-                WVarSolve.rescueWVars cfg scope bik fi s2 s3 (map fst bads)
+    (True, Unsafe _ _) -> do
+      liftSMT $ smtComment "solve: wvar-solve"
+      wres <- WVarSolve.solveWVars cfg scope fi s3
       return res2 { F.resWVars = wres }
     _ -> return res2
 
@@ -244,20 +245,21 @@ tidyPred =  go
 --
 refine
   :: forall a. F.Loc a
-  => S.HashSet F.Symbol
+  => S.HashSet F.WVar
+  -> S.HashSet F.Symbol
   -> F.IBindEnv
   -> F.BindEnv a
   -> Sol.Solution
   -> W.Worklist a
   -> SolveM a Sol.Solution
 --------------------------------------------------------------------------------
-refine scope bindingsInSmt be0 s0 w0 = go be0 s0 w0
+refine wVs scope bindingsInSmt be0 s0 w0 = go be0 s0 w0
   where
     go :: F.BindEnv a -> Sol.Solution -> W.Worklist a -> SolveM a Sol.Solution
     go be s w
       | Just (c, w', newScc, rnk) <- W.pop w = do
          i       <- tickIter newScc
-         (b, s') <- refineC scope bindingsInSmt be i s c
+         (b, s') <- refineC wVs scope bindingsInSmt be i s c
          lift $ writeLoud $ refineMsg i c b rnk (showpp s')
          let w'' = if b then W.push c w' else w'
          go be s' w''
@@ -273,7 +275,8 @@ refine scope bindingsInSmt be0 s0 w0 = go be0 s0 w0
 {-# SCC refineC #-}
 refineC
   :: forall a. (F.Loc a)
-  => S.HashSet F.Symbol
+  => S.HashSet F.WVar
+  -> S.HashSet F.Symbol
   -> F.IBindEnv
   -> F.BindEnv a
   -> Int
@@ -281,17 +284,36 @@ refineC
   -> F.SimpC a
   -> SolveM a (Bool, Sol.Solution)
 ---------------------------------------------------------------------------
-refineC scope bindingsInSmt be _i s c =
+refineC wVs scope bindingsInSmt be _i s c =
   do let krhs = rhsCands s
      cfg <- T.config <$> getContext
      if all (null . snd) krhs
         then return (False, s)
         else do
           let lhs = S.lhsPred cfg scope bindingsInSmt be s c
-          kqs <- forM krhs $ \(k, rhs) ->
-            (,) k . Sol.QB <$> filterValid (cstrSpan c) lhs rhs
+          kqs <- forM krhs $ \(k, rhs) -> do
+            kept <- filterValid (cstrSpan c) lhs rhs
+            captureWDrops cfg k rhs kept
+            return (k, Sol.QB kept)
           return $ S.update s kqs
   where
+    -- On the fly: when this (w-guarded) constraint drops candidate qualifiers
+    -- from a k-var head, record each dropped qualifier (already instantiated at
+    -- the head args) together with the guarding w-var(s). This is exactly the
+    -- provenance needed to build the w-var's weakest-precondition later: the
+    -- responsible constraint is *this* one, no post-hoc search required.
+    captureWDrops cfg k rhs kept
+      | not (wvars cfg) = return ()
+      | null guardWs    = return ()
+      | otherwise       =
+          recordWDrops
+            [ WDrop guardWs (F.subcId c) k qPred
+            | (qPred, eq) <- rhs, eq `notElem` kept ]
+      where
+        guardWs = [ F.kvarWVar wk
+                  | wk <- L.nub (V.envKVars be c)
+                  , S.member (F.kvarWVar wk) wVs ]
+
     rhsCands :: Sol.Solution -> [(F.KVar, Sol.Cand Sol.EQual)]
     rhsCands s = M.toList $ M.fromList $ map cnd ks
       where

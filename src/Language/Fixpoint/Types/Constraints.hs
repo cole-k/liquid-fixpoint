@@ -269,21 +269,21 @@ instance (NFData a) => NFData (Delayed a)
 type FixSolution  = M.HashMap KVar Expr
 type FixDelayedSolution  = M.HashMap KVar (Delayed Expr)
 
--- | Diagnostic information about how a failing (concrete) head /could/ be
---   rescued by strengthening one or more w-variables. This is populated only
---   when the @--wvars@ feature is on and the standard verdict is @Unsafe@; it
---   never changes the verdict itself.
+-- | Diagnostic information about a w-variable solution reconstructed from the
+--   qualifiers that had to be dropped from k-vars during Phase 1 by the
+--   constraints that w-var guards. This is populated only when the @--wvars@
+--   feature is on and the standard verdict is @Unsafe@; it never changes the
+--   verdict itself.
 --
---   For v1 we report the /rescued qualifiers/ (the qualifiers that were
---   stripped from k-vars during Phase 1 by w-guarded constraints and which,
---   re-added, make the head valid) together with the w-var(s) responsible for
---   them. Turning these rescued qualifiers into an actual solution for the
---   w-var (which requires weakest-precondition reasoning, since the qualifier
---   and the w-var generally live in different variable scopes) is left to a
---   later phase.
+--   For each w-var we report a candidate solution built by weakest
+--   precondition: for every @(constraint, dropped-qualifier)@ the w-var was
+--   responsible for, @wp := forall (vars not among the w-var's args) . LHS =>
+--   Q@head@, conjoined across all such drops. The resulting formula is
+--   generally quantified; eliminating the quantifiers (QE) to express it purely
+--   over the w-var's own arguments is a later step.
 data WVarFix = WVarFix
-  { wfWVars     :: ![WVar]   -- ^ the w-var(s) held responsible for this fix
-  , wfRescued   :: ![Expr]   -- ^ the rescued qualifier predicates (instantiated)
+  { wfSolution  :: !Expr     -- ^ candidate w-var solution (a WP; usually quantified)
+  , wfDrops     :: ![Expr]   -- ^ the per-drop WP conjuncts it was built from
   }
   deriving (Eq, Show, Generic)
 
@@ -291,18 +291,16 @@ instance NFData   WVarFix
 instance S.Store  WVarFix
 
 instance ToJSON WVarFix where
-  toJSON (WVarFix ws qs) = object
-    [ "wvars"   .= ws
-    , "rescued" .= map (render . toHornSMT) qs
+  toJSON (WVarFix sol ds) = object
+    [ "solution" .= render (toHornSMT sol)
+    , "drops"    .= map (render . toHornSMT) ds
     ]
 
 instance PPrint WVarFix where
-  pprintTidy k (WVarFix ws qs) =
-    "wvars" <+> pprintTidy k ws <+> "rescued" <+> pprintTidy k (toFix <$> qs)
+  pprintTidy k (WVarFix sol _) = pprintTidy k sol
 
--- | Per failing constraint (identified by its 'SubcId'), a list of candidate
---   fixes. See 'WVarFix'.
-type WVarResult = M.HashMap SubcId [WVarFix]
+-- | Per w-var, a candidate solution. See 'WVarFix'.
+type WVarResult = M.HashMap WVar WVarFix
 
 data Result a = Result
   { resStatus    :: !(FixResult a)
@@ -351,7 +349,7 @@ instance ToJSON a => ToJSON (Result a) where
     [ "status"            .= resStatus
     , "solution"          .= scCuts scopedSolution
     , "nonCutsSolution"   .= scNonCuts scopedSolution
-    , "wVars"             .= M.fromList [ (show i, fs) | (i, fs) <- M.toList resWVars ]
+    , "wVars"             .= M.fromList [ (wv w, fx) | (w, fx) <- M.toList resWVars ]
     ]
     where
       scopedSolution = scopedResult r
@@ -375,7 +373,7 @@ instance Semigroup (Result a) where
       soln  = resSolution r1  <> resSolution r2
       nonCutsSoln = resNonCutsSolution r1 <> resNonCutsSolution r2
       sorts = M.unionWith L.union (resSorts r1) (resSorts r2)
-      wvars = M.unionWith (++) (resWVars r1) (resWVars r2)
+      wvars = M.union (resWVars r1) (resWVars r2)
 
 instance Monoid (Result a) where
   mempty        = Result mempty mempty mempty mempty mempty

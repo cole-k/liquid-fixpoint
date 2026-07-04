@@ -26,6 +26,11 @@ module Language.Fixpoint.Solver.Monad
        , SolverState(..)
 
        , modifyContext
+
+         -- * W-var drop capture
+       , WDrop(..)
+       , recordWDrops
+       , getWDrops
        )
        where
 
@@ -67,7 +72,26 @@ data SolverState ann = SS
   { ssCtx     :: !Context         -- ^ SMT Solver Context
   , ssStats   :: !Stats           -- ^ Solver Statistics
   , ssElabParam :: !ElabParam      -- ^ Elaboration Parameters
+  , ssWDrops  :: ![WDrop]         -- ^ w-var drop provenance (only when --wvars)
   }
+
+-- | A qualifier dropped from a k-var's head by a /w-guarded/ constraint during
+--   Phase-1 refinement. This is the "on the fly" provenance: the responsible
+--   constraint is the one @refineC@ was processing when the drop happened, so
+--   no post-hoc search is needed.
+data WDrop = WDrop
+  { wdWVars :: ![F.WVar]     -- ^ the w-var(s) guarding the constraint that dropped it
+  , wdCid   :: !F.SubcId     -- ^ the constraint that dropped it
+  , wdKVar  :: !F.KVar       -- ^ the k-var it was dropped from
+  , wdHead  :: !F.Expr       -- ^ the dropped qualifier, instantiated at the head args (Q@head)
+  }
+
+recordWDrops :: [WDrop] -> SolveM ann ()
+recordWDrops []  = return ()
+recordWDrops ds  = modify $ \s -> s { ssWDrops = ds ++ ssWDrops s }
+
+getWDrops :: SolveM ann [WDrop]
+getWDrops = ssWDrops <$> get
 
 stats0    :: F.GInfo c b -> Stats
 stats0 fi = Stats nCs 0 0 0 0
@@ -82,7 +106,7 @@ runSolverM cfg sI elabParam act =
     res <- runStateT act' (s0 ctx)
     return (fst res)
   where
-    s0 ctx   = SS ctx (stats0 fi) elabParam
+    s0 ctx   = SS ctx (stats0 fi) elabParam []
     act'     = assumesAxioms (F.asserts fi) >> act
     release  = cleanupContext
     acquire  = makeContextWithSEnv cfg file initEnv (F.defns fi)
