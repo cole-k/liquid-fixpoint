@@ -92,7 +92,7 @@ solve cfg elabParam scope fi = do
     -- This overrides the normal qualifier-instantiation for those kvars.
     s0  = (siSol sI) { Sol.sMap = M.union wSeed (S.init cfg fi ks) }
     wSeed = M.fromList [ (F.wvarKVar w, Sol.QB [Sol.trueEqual])
-                       | w <- S.toList (bodyWVars cfg fi) ]
+                       | w <- S.toList (bodyWVars fi) ]
     ks  = siVars sI
     elabQBind ctx msg env (Sol.QB xs) = Sol.QB (map elabEQual xs)
       where
@@ -128,12 +128,13 @@ solverInfo cfg fI
 siKvars :: F.SInfo a -> S.HashSet F.KVar
 siKvars = S.fromList . M.keys . F.ws
 
--- | The "only-body" w-vars, or empty when the @--wvars@ feature is off. These
--- are the w-vars that are seeded to `true` during Phase 1.
-bodyWVars :: Config -> F.SInfo a -> S.HashSet F.WVar
-bodyWVars cfg fi
-  | wvars cfg = WVar.bodyOnlyWVars fi
-  | otherwise = mempty
+-- | The "only-body" w-vars. These are seeded to `true` during Phase 1 and
+-- never refined (they never appear as a head), so w-vars are effectively
+-- treated as `true` -- i.e. as if they did not exist. This is unconditional:
+-- the @--wvars@ flag only controls the extra rescue analysis/reporting, not
+-- the (always-correct) "assume true" semantics.
+bodyWVars :: F.SInfo a -> S.HashSet F.WVar
+bodyWVars = WVar.bodyOnlyWVars
 
 doInterpret :: (F.Loc a) =>  Config -> F.SInfo a -> [F.SubcId] -> SolveM a (F.BindEnv a)
 doInterpret cfg fi subcIds = liftIO $ instInterpreter cfg fi (Just subcIds)

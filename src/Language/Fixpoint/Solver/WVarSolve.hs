@@ -34,6 +34,7 @@ import qualified Data.HashMap.Strict                as M
 import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
 import           Control.Monad                      (filterM)
+-- import qualified Debug.Trace                     as Debug  -- for [WVAR-PERF] instrumentation
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
@@ -64,6 +65,16 @@ solveWVars cfg scope fi sFinal = do
   -- on the provenance) before building/checking WPs.
   let uniqueDrops = M.elems $ M.fromList [ (dropKey d, d) | d <- drops ]
       cands = [ (w, wpOfDrop w d) | d <- uniqueDrops, w <- wdWVars d ]
+  -- PERF INSTRUMENTATION (kept handy, disabled): to compare the cost of the
+  -- current "non-vacuity (quantified MBQI) first" ordering against a possible
+  -- "QE first, then quantifier-free non-vacuity" ordering on bigger/harder
+  -- examples, uncomment the Debug.trace below (and its import) to see how many
+  -- drops / candidate (w,drop) pairs / quantified SMT queries we issue.
+  --
+  -- perDrop <- Debug.trace ("[WVAR-PERF] drops=" ++ show (length drops)
+  --                         ++ " uniqueDrops=" ++ show (length uniqueDrops)
+  --                         ++ " candidate (w,drop) pairs=" ++ show (length cands)) $
+  --            filterM nonVacuous cands
   perDrop <- filterM nonVacuous cands
   let perWVar = M.fromListWith (++) [ (w, [e]) | (w, (e, _)) <- perDrop ]
   return $ M.map mkFix perWVar

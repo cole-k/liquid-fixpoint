@@ -336,11 +336,10 @@ edgeDeps cfg si  = forceKuts ks
     -- Force w-vars into the cut set so the elimination pass never tries to
     -- substitute them away: they are resolved by their seeded `true` solution
     -- (Phase 1), not by elimination. This is a Phase-1 mechanism, not a claim
-    -- that w-vars are "really" cut vars. Guarded by --wvars so the k-var-only
-    -- path is unaffected.
-    wvarKs
-      | wvars cfg = S.map F.wvarKVar (F.wVars si)
-      | otherwise = mempty
+    -- that w-vars are "really" cut vars. Unconditional: w-vars are always
+    -- treated as `true` (as if they did not exist); the --wvars flag only
+    -- controls the extra rescue analysis.
+    wvarKs       = S.map F.wvarKVar (F.wVars si)
 
 edgeDeps' :: Config -> [CEdge] -> Elims F.KVar
 edgeDeps' cfg es = Deps (takeK cs) (takeK ns)

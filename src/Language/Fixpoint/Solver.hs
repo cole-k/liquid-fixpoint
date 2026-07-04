@@ -300,7 +300,10 @@ reduceFInfo cfg fi = do
 
 solveNative' !cfg !fi0 = do
   (elabParam, si6) <- simplifyFInfo cfg fi0
-  si7 <- if wvars cfg then prepareWVars si6 else return si6
+  -- Always elide "only-head" w-vars (they are never consulted) and warn about
+  -- "both"-position ones. Unconditional so w-vars behave as `true`/nonexistent
+  -- regardless of --wvars; the flag only gates the rescue analysis/reporting.
+  si7 <- prepareWVars si6
   let scope = sInfoScope cfg si7
   res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si7
   let res = simplifyResult cfg scope res0
