@@ -36,6 +36,7 @@ import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
 import           Control.Monad                      (foldM, filterM)
 import           Control.Monad.IO.Class             (liftIO)
+import           Data.IORef                         (IORef, newIORef, readIORef, modifyIORef')
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
@@ -80,8 +81,12 @@ solveWVars cfg scope fi sFinal failCs = do
   -- every constraint where their k-var is a head, via LHS or a saving w-var.
   reclaimed <- fixReclaimed seed
   -- Report: per failing head, per w-var, the WP for the reclaimed qualifiers
-  -- that w-var still saves and that make the head valid.
-  cands <- reportCandidates reclaimed
+  -- that w-var still saves and that make the head valid. The subset search can
+  -- backtrack; bound it by a solver-call budget so a hard head (e.g. over
+  -- uninterpreted functions) can never blow up (this only affects the
+  -- diagnostic, never the verdict).
+  budget <- liftIO (newIORef (2000 :: Int))
+  cands <- reportCandidates budget reclaimed
   -- Simplify each WP conjunct with QE (fresh context; best-effort).
   let ws0 = map fst cands
       es0 = map snd cands
@@ -102,10 +107,11 @@ solveWVars cfg scope fi sFinal failCs = do
     ----------------------------------------------------------------------------
     -- The reclaimed-qualifier fixpoint (monotone: only shrinks).
     ----------------------------------------------------------------------------
+    -- The saver-survival check depends only on the fixed final solution and the
+    -- constraints (not on the reclaimed set), so a single pass already reaches
+    -- the fixpoint -- no iteration needed.
     fixReclaimed :: Reclaimed -> SolveM a Reclaimed
-    fixReclaimed r = do
-      r' <- stepReclaimed r
-      if r' `sameReclaimed` r then return r else fixReclaimed r'
+    fixReclaimed = stepReclaimed
 
     -- one pass: re-check every reclaimed qualifier against its k-var's head
     -- constraints, shrinking savers / dropping qualifiers.
@@ -139,16 +145,33 @@ solveWVars cfg scope fi sFinal failCs = do
                filterM (\w -> canSave w c' lhs qHead) (S.toList ws)
 
     -- can w-var @w@ prove @qHead@ on @c'@? It must guard @c'@ (occur in its LHS)
-    -- and its WP there must be non-vacuous.
+    -- can w-var @w@ prove @qHead@ on @c'@? It must guard @c'@ (occur in its LHS)
+    -- and its WP there must be non-vacuous. We eliminate the WP's quantifier with
+    -- QE first so the satisfiability check is quantifier-free (fast) instead of
+    -- relying on MBQI, which is ~0.5s per quantified query.
     canSave :: F.WVar -> F.SimpC a -> F.Expr -> F.Expr -> SolveM a Bool
     canSave w c' lhs qHead
       | not (w `guards` c') = return False
-      | otherwise           =
+      | otherwise           = do
           let (wp, dom) = mkWP w c' lhs qHead
-          in  satisfiable (F.pAnd [wp, dom])
+          -- Non-vacuity is decided by eliminating the WP's quantifier (QE) and a
+          -- cheap quantifier-free satisfiability check. For WPs over uninterpreted
+          -- functions QE is both slow and usually cannot eliminate the
+          -- quantifier, so we skip it and conservatively keep the saver (whether
+          -- the solution really fixes a head is re-checked at report time).
+          if hasApp wp then return True else do
+            wp' <- liftIO (qe1 wp)
+            if hasQuant wp' then return True
+                            else satisfiable (F.pAnd [wp', dom])
+
+    -- QE a single formula (fresh Z3 context); returns it unchanged on failure.
+    qe1 :: F.Expr -> IO F.Expr
+    qe1 e = do es <- qeMany cfg [e]
+               return (case es of (x:_) -> x; [] -> e)
 
     guards :: F.WVar -> F.SimpC a -> Bool
     guards w c' = F.wvarKVar w `elem` V.envKVars be c'
+
 
     ----------------------------------------------------------------------------
     -- Reporting
@@ -162,24 +185,29 @@ solveWVars cfg scope fi sFinal failCs = do
     -- valid; report the WP for each qualifier in that subset. Consistency: we
     -- add a qualifier only if it keeps the enhanced LHS satisfiable (so we never
     -- "prove" the head by making a k-var contradictory).
-    reportCandidates :: Reclaimed -> SolveM a [(F.WVar, F.Expr)]
-    reportCandidates r = fmap concat $ forM' failCs $ \h ->
+    reportCandidates :: IORef Int -> Reclaimed -> SolveM a [(F.WVar, F.Expr)]
+    reportCandidates budget r = fmap concat $ forM' failCs $ \h ->
       fmap concat $ forM' (allWVars r) $ \w -> do
         let hKs   = V.envKVars be h
             quals = [ (k, eq) | ((k, eq), ws) <- r, S.member w ws, k `elem` hKs ]
-        core <- growHead h [] quals
+        core <- growHead budget h [] quals
         return [ (w, wp) | (k, eq) <- core, (wp, _) <- wpAt w k eq ]
 
-    -- greedily grow a consistent qualifier set that proves head @h@; [] if none.
-    growHead :: F.SimpC a -> [RQual] -> [RQual] -> SolveM a [RQual]
-    growHead h acc rest = do
-      done <- headValid h acc
-      if done then return acc else go rest
+    -- greedily grow a consistent qualifier set that proves head @h@; [] if none
+    -- (or the budget is exhausted). Add a candidate only if it keeps the
+    -- enhanced LHS satisfiable, and stop as soon as the head is valid.
+    growHead :: IORef Int -> F.SimpC a -> [RQual] -> [RQual] -> SolveM a [RQual]
+    growHead budget h acc rest = do
+      n <- liftIO (readIORef budget)
+      if n <= 0 then return [] else do
+        done <- tick >> headValid h acc
+        if done then return acc else go rest
       where
+        tick = liftIO (modifyIORef' budget (subtract 1))
         go []       = return []
         go (q:rest') = do
-          ok <- headLhsSat h (acc ++ [q])
-          if ok then do r <- growHead h (acc ++ [q]) rest'
+          ok <- tick >> headLhsSat h (acc ++ [q])
+          if ok then do r <- growHead budget h (acc ++ [q]) rest'
                         if null r then go rest' else return r
                 else go rest'
 
@@ -256,12 +284,6 @@ solveWVars cfg scope fi sFinal failCs = do
     allWVars :: Reclaimed -> [F.WVar]
     allWVars = L.nub . concatMap (S.toList . snd)
 
-    -- compare two reclaimed sets (by qualifier identity + saver set) for the
-    -- fixpoint termination test.
-    sameReclaimed :: Reclaimed -> Reclaimed -> Bool
-    sameReclaimed a b = norm a == norm b
-      where norm r = L.sort [ (rqKey rq, L.sort (S.toList ws)) | (rq, ws) <- r ]
-
     forM' :: [b] -> (b -> SolveM a c) -> SolveM a [c]
     forM' xs f = mapM f xs
 
@@ -291,6 +313,35 @@ rhsKSubs :: F.Expr -> [(F.KVar, F.Subst, F.TyVarSubst)]
 rhsKSubs (F.PAnd ps)         = concatMap rhsKSubs ps
 rhsKSubs (F.PKVar k tvsu su) = [(k, F.substFromKSubst su, tvsu)]
 rhsKSubs _                   = []
+
+-- | Does the expression contain a quantifier?
+hasQuant :: F.Expr -> Bool
+hasQuant = anyExpr q where q (F.PAll _ _) = True; q (F.PExist _ _) = True; q _ = False
+
+-- | Does the expression contain a (non-nullary) function application?
+hasApp :: F.Expr -> Bool
+hasApp = anyExpr q where q (F.EApp _ _) = True; q _ = False
+
+-- | Is the predicate @p@ true of the expression or any subexpression?
+anyExpr :: (F.Expr -> Bool) -> F.Expr -> Bool
+anyExpr p = go
+  where
+    go e | p e = True
+    go e = case e of
+      F.PAll _ b    -> go b
+      F.PExist _ b  -> go b
+      F.PAnd xs     -> any go xs
+      F.POr xs      -> any go xs
+      F.PNot x      -> go x
+      F.PImp a b    -> go a || go b
+      F.PIff a b    -> go a || go b
+      F.PAtom _ a b -> go a || go b
+      F.EBin _ a b  -> go a || go b
+      F.ENeg x      -> go x
+      F.EApp a b    -> go a || go b
+      F.ECst x _    -> go x
+      F.EIte a b c  -> go a || go b || go c
+      _             -> False
 
 -- | Collect the @PKVar@ conjuncts of an expression.
 kvarApps :: F.Expr -> [F.Expr]
