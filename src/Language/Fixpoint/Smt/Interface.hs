@@ -44,6 +44,7 @@ module Language.Fixpoint.Smt.Interface (
     , qe
     , qeWith
     , qeTactic
+    , qeMany
 
     -- * Query API
     , smtDecl
@@ -263,7 +264,27 @@ qeWith tactic e =
       Left perr -> die $ err dummySpan $ text
                     ("qe: could not parse Z3 output:\n" ++ T.unpack out ++ "\nparse error: " ++ perr)
 
--- | Send a pre-built command to the solver and return its raw response text.
+-- | Run 'qe' on several formulas in a /fresh, isolated/ SMT context.
+--
+--   This is important when QE is used after (or during) a solve: Z3's
+--   @(apply qe)@ operates on the /entire current assertion set/, so running it
+--   in the live solver context would eliminate quantifiers over the solver's
+--   ambient assertions too, producing garbage. A throwaway context whose only
+--   assertions are the formula under QE avoids that.
+--
+--   The context is created with an /empty/ symbol environment: 'qe' declares
+--   the free variables/function symbols of each formula itself, so pre-declaring
+--   the whole 'SymEnv' would cause "already declared" conflicts. A fresh context
+--   per formula gives maximal isolation. Best-effort: a formula QE can't handle
+--   (or whose Z3 output can't be parsed) is returned unchanged.
+qeMany :: Config -> [Expr] -> IO [Expr]
+qeMany cfg es = mapM one es
+  where
+    one :: Expr -> IO Expr
+    one e =
+      (bracket (makeContextWithSEnv cfg "" mempty mempty) cleanupContext $ \ctx ->
+         evalStateT (qe e) ctx)
+      `catch` \(_ :: SomeException) -> pure e
 --   Unlike 'commandRaw', this does not parse the response into a 'Response';
 --   the underlying backend already reads a complete, balanced s-expression
 --   (see @SMTLIB.Backends.Process.scanParen@), which is exactly what a

@@ -34,11 +34,13 @@ import qualified Data.HashMap.Strict                as M
 import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
 import           Control.Monad                      (filterM)
+import           Control.Monad.IO.Class             (liftIO)
 -- import qualified Debug.Trace                     as Debug  -- for [WVAR-PERF] instrumentation
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
 import           Language.Fixpoint.Solver.Monad     (SolveM, WDrop(..), getWDrops, filterValid, smtEnablembqi)
+import           Language.Fixpoint.Smt.Interface    (qeMany)
 import qualified Language.Fixpoint.Solver.Solution  as So
 
 --------------------------------------------------------------------------------
@@ -76,7 +78,14 @@ solveWVars cfg scope fi sFinal = do
   --                         ++ " candidate (w,drop) pairs=" ++ show (length cands)) $
   --            filterM nonVacuous cands
   perDrop <- filterM nonVacuous cands
-  let perWVar = M.fromListWith (++) [ (w, [e]) | (w, (e, _)) <- perDrop ]
+  -- Simplify each surviving WP conjunct with Z3 quantifier elimination, in a
+  -- FRESH context (qeMany) so `(apply qe)` does not see the main solver's
+  -- ambient assertions. Best-effort: a formula QE can't handle is returned
+  -- unchanged.
+  let ws0  = map fst perDrop
+      es0  = map (fst . snd) perDrop
+  es1 <- liftIO $ qeMany cfg es0
+  let perWVar = M.fromListWith (++) [ (w, [e]) | (w, e) <- zip ws0 es1 ]
   return $ M.map mkFix perWVar
   where
     be = F.bs fi
