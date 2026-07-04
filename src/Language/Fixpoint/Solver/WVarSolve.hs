@@ -33,16 +33,20 @@ module Language.Fixpoint.Solver.WVarSolve
 import qualified Data.HashMap.Strict                as M
 import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
+import           Control.Monad                      (filterM)
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
-import           Language.Fixpoint.Solver.Monad     (SolveM, WDrop(..), getWDrops)
+import           Language.Fixpoint.Solver.Monad     (SolveM, WDrop(..), getWDrops, filterValid, smtEnablembqi)
 import qualified Language.Fixpoint.Solver.Solution  as So
 
 --------------------------------------------------------------------------------
 -- | Build candidate w-var solutions from the drops captured during Phase 1.
---   Runs inside 'SolveM' (after refinement) but needs no SMT queries itself --
---   it is pure term construction over the final solution.
+--   Runs inside 'SolveM' (after refinement). Each per-drop WP conjunct is
+--   checked for non-vacuity (satisfiability): a conjunct that is identically
+--   @false@ means the w-var cannot actually rescue that qualifier (typically an
+--   "ambient" w-var that guards the constraint but whose arguments don't
+--   mention the variable being constrained), so it is dropped.
 --------------------------------------------------------------------------------
 solveWVars
   :: forall a. (F.Loc a)
@@ -53,8 +57,13 @@ solveWVars
   -> SolveM a F.WVarResult
 solveWVars cfg scope fi sFinal = do
   drops <- getWDrops
-  let perWVar = M.fromListWith (++)
-        [ (w, [wpOfDrop d]) | d <- drops, w <- wdWVars d ]
+  -- The non-vacuity checks below are quantified; MBQI must be on for the
+  -- solver to decide them (the preamble disables it for the QF Phase-1 checks).
+  smtEnablembqi
+  -- one WP conjunct per (w-var, drop); keep only non-vacuous ones
+  perDrop <- filterM nonVacuous
+               [ (w, wpOfDrop w d) | d <- drops, w <- wdWVars d ]
+  let perWVar = M.fromListWith (++) [ (w, [e]) | (w, (e, _)) <- perDrop ]
   return $ M.map mkFix perWVar
   where
     be = F.bs fi
@@ -65,33 +74,61 @@ solveWVars cfg scope fi sFinal = do
       F.WVarFix { F.wfSolution = F.pAnd (L.nub conjs)
                 , F.wfDrops    = L.nub conjs }
 
-    -- | The WP conjunct for a single recorded drop.
-    wpOfDrop :: WDrop -> F.Expr
-    wpOfDrop (WDrop _ cid _ qHead) =
+    -- | A WP conjunct is useful iff, conjoined with the constraint's LHS
+    --   (the reachable domain), it is satisfiable. Otherwise the only way to
+    --   satisfy the WP is to make the w-var's guard false on the whole reachable
+    --   domain -- i.e. a vacuous "fix" -- so we reject it. This is what filters
+    --   out an ambient w-var (e.g. one guarding the whole constraint whose args
+    --   don't mention the variable being constrained).
+    nonVacuous :: (F.WVar, (F.Expr, F.Expr)) -> SolveM a Bool
+    nonVacuous (_, (phi, lhs)) = satisfiable (F.pAnd [phi, lhs])
+
+    -- | @phi@ is satisfiable  <=>  @phi => false@ is NOT valid. We assert @phi@
+    --   itself as the LHS so its free variables get declared to the solver.
+    satisfiable :: F.Expr -> SolveM a Bool
+    satisfiable phi = do
+      valid <- not . null <$> filterValid F.dummySpan phi [(F.PFalse, ())]
+      return (not valid)
+
+    -- | The WP conjunct for a single recorded drop, /for a specific w-var/:
+    --   only that w-var's own arguments are kept free; every other variable in
+    --   the LHS is universally quantified. Returns the conjunct and the LHS
+    --   context (used for the non-vacuity check).
+    --
+    --   The quantified variables are alpha-renamed to fresh names so they can
+    --   never collide with the w-var's (free) argument variables -- including in
+    --   the non-vacuity check, where the raw LHS (with those variables free) is
+    --   conjoined with the quantified WP.
+    wpOfDrop :: F.WVar -> WDrop -> (F.Expr, F.Expr)
+    wpOfDrop w (WDrop _ cid _ qHead) =
       case M.lookup cid cm of
-        Nothing -> F.PTrue
+        Nothing -> (F.PTrue, F.PTrue)
         Just c  ->
           let lhs    = So.lhsPred cfg scope F.emptyIBindEnv be sFinal c
               body   = F.PImp lhs qHead
-              -- variables the w-var "sees": the args of every weak occurrence in c
-              wargs  = wvarArgSyms c
-              -- quantify everything free in body that is not a w-var argument,
-              -- restricting to symbols that are actually binders of c (so we
-              -- have their sorts and don't accidentally bind constants).
-              qsorts = [ (x, t)
+              wargs  = wvarArgSyms w c
+              qvars  = [ (x, t)
                        | (x, t) <- binderSorts c
                        , x `S.member` F.exprSymbolsSet body
                        , not (x `S.member` wargs) ]
-          in  if null qsorts then body else F.PAll qsorts body
+              -- alpha-rename quantified vars to fresh names
+              su     = F.mkSubst [ (x, F.eVar (fresh x)) | (x, _) <- qvars ]
+              qvars' = [ (fresh x, t) | (x, t) <- qvars ]
+              wp     = if null qvars' then body
+                       else F.PAll qvars' (F.subst su body)
+          in  (wp, lhs)
 
-    -- | Symbols that appear as arguments to a weak k-var occurrence in @c@'s
-    --   environment -- the variables the w-var is allowed to keep free.
-    wvarArgSyms :: F.SimpC a -> S.HashSet F.Symbol
-    wvarArgSyms c = S.fromList
+    fresh :: F.Symbol -> F.Symbol
+    fresh x = F.suffixSymbol x (F.symbol "wvq")
+
+    -- | Symbols that appear as arguments to occurrences of the /given/ w-var in
+    --   @c@'s environment -- the variables that w-var is allowed to keep free.
+    wvarArgSyms :: F.WVar -> F.SimpC a -> S.HashSet F.Symbol
+    wvarArgSyms w c = S.fromList
       [ y
       | (_, sr) <- envBinds c
       , F.PKVar k _ su <- kvarApps (F.reftPred (F.sr_reft sr))
-      , S.member (F.kvarWVar k) (F.wVars fi)
+      , k == F.wvarKVar w
       , e <- M.elems (F.fromKVarSubst su)
       , y <- S.toList (F.exprSymbolsSet e) ]
 
