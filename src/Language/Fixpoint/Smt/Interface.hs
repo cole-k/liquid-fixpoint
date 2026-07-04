@@ -40,6 +40,11 @@ module Language.Fixpoint.Smt.Interface (
     , command
     , smtSetMbqi
 
+    -- * Quantifier elimination
+    , qe
+    , qeWith
+    , qeTactic
+
     -- * Query API
     , smtDecl
     , smtDecls
@@ -74,6 +79,7 @@ import qualified Language.Fixpoint.Types         as F
 import           Language.Fixpoint.Smt.Types
 import qualified Language.Fixpoint.Smt.Theories as Thy
 import           Language.Fixpoint.Smt.Serialize ()
+import qualified Language.Fixpoint.Smt.Parse    as Parse
 import           Control.Applicative      ((<|>))
 import           Control.Monad
 import           Control.Monad.State
@@ -212,6 +218,110 @@ commandB cmdBS       = do
     BS.hPutBuilder h cmdBS
     LBS.hPutStr h "\n"
   lift $ SMTLIB.Backends.command_ ctxSolver cmdBS >> return Ok
+
+--------------------------------------------------------------------------------
+-- | Quantifier elimination ----------------------------------------------------
+--------------------------------------------------------------------------------
+
+-- | Eliminate quantifiers from (and simplify) an 'Expr' using Z3's tactics,
+--   returning a logically-equivalent 'Expr'.
+--
+--   Concretely: in a fresh push/pop scope we declare the free variables and
+--   function symbols of @e@ (assumed 'Int'-sorted, as produced by the w-variable
+--   weakest-precondition machinery), assert @e@, run
+--   @(apply (then qe ctx-solver-simplify))@, read the resulting
+--   @(goals (goal ...))@ s-expression and parse it back with
+--   "Language.Fixpoint.Smt.Parse".
+--
+--   The result should be quantifier-free. See 'Language.Fixpoint.Smt.Parse' for
+--   the exact 'Expr' subset supported and the round-trip caveats
+--   (@=@/@PIff@/@Ne@ are read as @PAtom Eq@ etc.).
+qe :: Expr -> SmtM Expr
+qe = qeWith qeTactic
+
+-- | The default Z3 tactic used by 'qe': quantifier elimination followed by
+--   context solver simplification, which produces the cleanest parseable
+--   output in our experiments (it drops the residual @true@ conjuncts that a
+--   bare @qe@ leaves behind).
+qeTactic :: T.Text
+qeTactic = "(then qe ctx-solver-simplify)"
+
+-- | A variant of 'qe' where the caller supplies the Z3 apply-tactic text, e.g.
+--   @"qe"@, @"(then qe simplify)"@, or @"(then qe ctx-solver-simplify)"@.
+qeWith :: T.Text -> Expr -> SmtM Expr
+qeWith tactic e =
+  smtBracket "qe" $ do
+    -- declare the free variables / function symbols of `e`
+    mapM_ (uncurry smtDecl) (freeSymbolSorts e)
+    -- assert the (possibly quantified) formula ...
+    smtAssertDecl e
+    -- ... and ask Z3 to eliminate quantifiers + simplify
+    let cmd = "(apply " <> Builder.fromText tactic <> ")"
+    out <- commandRawText cmd
+    case Parse.parseGoals out of
+      Right e' -> pure e'
+      Left perr -> die $ err dummySpan $ text
+                    ("qe: could not parse Z3 output:\n" ++ T.unpack out ++ "\nparse error: " ++ perr)
+
+-- | Send a pre-built command to the solver and return its raw response text.
+--   Unlike 'commandRaw', this does not parse the response into a 'Response';
+--   the underlying backend already reads a complete, balanced s-expression
+--   (see @SMTLIB.Backends.Process.scanParen@), which is exactly what a
+--   @(apply ...)@ call returns.
+commandRawText :: Builder -> SmtM T.Text
+commandRawText cmdBS = do
+  ctxLog     <- gets ctxLog
+  ctxSolver  <- gets ctxSolver
+  ctxVerbose <- gets ctxVerbose
+  forM_ ctxLog $ \h -> lift $ do
+    BS.hPutBuilder h cmdBS
+    LBS.hPutStr h "\n"
+  lift $ do
+    resp <- SMTLIB.Backends.command ctxSolver cmdBS
+    let respTxt = TE.decodeUtf8With (const $ const $ Just ' ') $ LBS.toStrict resp
+    forM_ ctxLog $ \h -> Data.Text.IO.hPutStrLn h ("; SMT QE Says: " <> respTxt)
+    when ctxVerbose $ Data.Text.IO.putStrLn ("; SMT QE Says: " <> respTxt)
+    return respTxt
+
+-- | Collect the free variables and function symbols of an 'Expr' together with
+--   a suitable 'Int'-based 'Sort' for declaring them to the solver: a symbol
+--   applied to @n@ arguments becomes an @Int -> ... -> Int@ function; an
+--   unapplied symbol becomes @Int@. Bound (quantified) variables are excluded.
+freeSymbolSorts :: Expr -> [(Symbol, Sort)]
+freeSymbolSorts e0 =
+  [ (x, mkSort n) | (x, n) <- M.toList (go mempty e0) ]
+  where
+    mkSort 0 = intSort
+    mkSort n = mkFFunc 0 (replicate (n + 1) intSort)
+
+    unionsWith f = foldr (M.unionWith f) mempty
+
+    -- @bound@ is the set of quantifier-bound variables currently in scope.
+    -- The accumulator maps each free symbol to its (max) application arity.
+    go bound e = case e of
+      EApp _ _        -> let (h, as) = splitEApp e
+                             m0      = foldr (M.unionWith max) mempty (map (go bound) as)
+                         in case h of
+                              EVar f | not (f `elem` bound) -> M.insertWith max f (length as) m0
+                              _                              -> M.unionWith max m0 (go bound h)
+      EVar x
+        | x `elem` bound -> mempty
+        | otherwise      -> M.singleton x 0
+      ENeg e1          -> go bound e1
+      EBin _ e1 e2     -> M.unionWith max (go bound e1) (go bound e2)
+      EIte e1 e2 e3    -> unionsWith max [go bound e1, go bound e2, go bound e3]
+      ECst e1 _        -> go bound e1
+      ECoerc _ _ e1    -> go bound e1
+      ELet x e1 e2     -> M.unionWith max (go bound e1) (go (x : bound) e2)
+      PAnd es          -> unionsWith max (map (go bound) es)
+      POr es           -> unionsWith max (map (go bound) es)
+      PNot e1          -> go bound e1
+      PImp e1 e2       -> M.unionWith max (go bound e1) (go bound e2)
+      PIff e1 e2       -> M.unionWith max (go bound e1) (go bound e2)
+      PAtom _ e1 e2    -> M.unionWith max (go bound e1) (go bound e2)
+      PAll xts e1      -> go (map fst xts ++ bound) e1
+      PExist xts e1    -> go (map fst xts ++ bound) e1
+      _                -> mempty
 
 smtSetMbqi :: SmtM ()
 smtSetMbqi = interact' SetMbqi

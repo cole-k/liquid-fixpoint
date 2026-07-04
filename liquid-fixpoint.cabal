@@ -74,6 +74,7 @@ library
                     Language.Fixpoint.Misc
                     Language.Fixpoint.Parse
                     Language.Fixpoint.Smt.Interface
+                    Language.Fixpoint.Smt.Parse
                     Language.Fixpoint.Smt.Serialize
                     Language.Fixpoint.Smt.Theories
                     Language.Fixpoint.Smt.Types
@@ -232,6 +233,7 @@ test-suite tasty
   other-modules:    Arbitrary
                     InterpretTests
                     ParserTests
+                    QeTests
                     ShareMapReference
                     ShareMapTests
                     SimplifyInterpreter
@@ -248,9 +250,11 @@ test-suite tasty
   hs-source-dirs:   tests/tasty
   ghc-options:      -threaded
   build-depends:    base            >= 4.9.1.0 && < 5
+                  , bytestring
                   , containers
                   , hashable
                   , liquid-fixpoint
+                  , mtl
                   , tasty           >= 0.10
                   , tasty-hunit     >= 0.9
                   , tasty-quickcheck
