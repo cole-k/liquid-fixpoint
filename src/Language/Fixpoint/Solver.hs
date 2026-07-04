@@ -45,6 +45,7 @@ import           Language.Fixpoint.SortCheck            (ElabParam (..), Elabora
 import           Language.Fixpoint.Solver.Extensionality (expand)
 import           Language.Fixpoint.Solver.Prettify (savePrettifiedQuery)
 import           Language.Fixpoint.Solver.UniqifyKVars (wfcUniqify)
+import qualified Language.Fixpoint.Solver.WVar      as WVar
 import qualified Language.Fixpoint.Solver.Solve     as Sol
 import qualified Language.Fixpoint.Solver.Solution  as Sol
 import           Language.Fixpoint.Types.Config
@@ -285,8 +286,9 @@ reduceFInfo cfg fi = do
 
 solveNative' !cfg !fi0 = do
   (elabParam, si6) <- simplifyFInfo cfg fi0
-  let scope = sInfoScope cfg si6
-  res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si6
+  si7 <- if wvars cfg then prepareWVars si6 else return si6
+  let scope = sInfoScope cfg si7
+  res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si7
   let res = simplifyResult cfg scope res0
   -- rnf soln `seq` donePhase Loud "Solve2"
   --let stat = resStatus res
@@ -295,6 +297,20 @@ solveNative' !cfg !fi0 = do
   -- writeLoud $ "\nSolution:\n"  ++ showpp (resSolution res)
   -- colorStrLn (colorResult stat) (show stat)
   return res
+
+-- | Pre-process w-vars before solving: warn about w-vars that appear in both
+-- head and body position (an unhandled edge case, left to behave as ordinary
+-- k-vars), and elide "only-head" w-vars, which are never consulted.
+prepareWVars :: SInfo a -> IO (SInfo a)
+prepareWVars si = do
+  let cls  = WVar.classifyWVars si
+      both = WVar.wcBoth cls
+  when (not (HS.null both)) $
+    colorStrLn Wary $
+      "WARNING: w-var(s) appear in both head and body position and will be "
+      ++ "treated as ordinary k-vars: "
+      ++ unwords (show <$> HS.toList both)
+  return (WVar.elideOnlyHeadWVars si)
 
 --------------------------------------------------------------------------------
 -- | Scope ---------------------------------------------------------------------

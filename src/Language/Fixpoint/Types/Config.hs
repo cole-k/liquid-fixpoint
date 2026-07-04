@@ -109,6 +109,7 @@ data Config = Config
   , noStringTheory :: Bool             -- ^ disable interpretation of string theory by SMT
   , explicitKvars  :: Bool             -- ^ use explicitly declared kvars (horn style) which disables several "defensive simplifications"
   , sortedSolution :: Bool             -- ^ leave sorts in the solution
+  , wvars          :: Bool             -- ^ enable weak k-vars (w-variables): solve them diagnostically after a failure
   , saveDir        :: Maybe FilePath    -- ^ output directory for --save generated files (default: .liquid/ next to source)
   } deriving (Eq,Show,Generic)
 
@@ -258,6 +259,7 @@ defConfig = Config
   , restOrdering       = "rpo"
   , explicitKvars      = False
   , sortedSolution     = False
+  , wvars              = False
   }
 
 -- | An individual parsed flag (modifier to Config, verbosity change, or exit).
@@ -378,6 +380,8 @@ fxOptions =
       "Use explicitly declared kvars (horn style) which disables several defensive simplifications"
   , opt0 "sorted-solution"         (\c -> c { sortedSolution = True })
       "Leave elaborated sorts in the solution (only for machine consumption)"
+  , opt0 "wvars"                   (\c -> c { wvars = True })
+      "Enable weak k-vars (w-variables): on failure, diagnostically report which w-vars and qualifiers could rescue each failing head"
   , Option "v" ["verbose"]         (NoArg (FxVerbosity Loud))
       "Be more verbose"
   , Option "q" ["quiet"]           (NoArg (FxVerbosity Quiet))

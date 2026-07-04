@@ -27,6 +27,7 @@ import qualified Language.Fixpoint.Solver.Solution  as S
 import qualified Language.Fixpoint.Smt.Types as T
 import qualified Language.Fixpoint.Solver.Worklist  as W
 import qualified Language.Fixpoint.Solver.Eliminate as E
+import qualified Language.Fixpoint.Solver.WVar      as WVar
 import           Language.Fixpoint.Solver.Monad
 import           Language.Fixpoint.Utils.Progress
 import           Language.Fixpoint.Graph
@@ -84,7 +85,12 @@ solve cfg elabParam scope fi = do
     -- S.init provides an initial solution for the cut KVars
     sI  = solverInfo cfg fi
     wkl = W.init sI
-    s0  = (siSol sI) { Sol.sMap = S.init cfg fi ks }
+    -- Seed every "only-body" w-var to `true`: it is assumed true during Phase 1
+    -- and, since it never appears as a head, is never refined away from `true`.
+    -- This overrides the normal qualifier-instantiation for those kvars.
+    s0  = (siSol sI) { Sol.sMap = M.union wSeed (S.init cfg fi ks) }
+    wSeed = M.fromList [ (F.wvarKVar w, Sol.QB [Sol.trueEqual])
+                       | w <- S.toList (bodyWVars cfg fi) ]
     ks  = siVars sI
     elabQBind ctx msg env (Sol.QB xs) = Sol.QB (map elabEQual xs)
       where
@@ -119,6 +125,13 @@ solverInfo cfg fI
 
 siKvars :: F.SInfo a -> S.HashSet F.KVar
 siKvars = S.fromList . M.keys . F.ws
+
+-- | The "only-body" w-vars, or empty when the @--wvars@ feature is off. These
+-- are the w-vars that are seeded to `true` during Phase 1.
+bodyWVars :: Config -> F.SInfo a -> S.HashSet F.WVar
+bodyWVars cfg fi
+  | wvars cfg = WVar.bodyOnlyWVars fi
+  | otherwise = mempty
 
 doInterpret :: (F.Loc a) =>  Config -> F.SInfo a -> [F.SubcId] -> SolveM a (F.BindEnv a)
 doInterpret cfg fi subcIds = liftIO $ instInterpreter cfg fi (Just subcIds)

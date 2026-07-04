@@ -328,11 +328,19 @@ edgeDeps cfg si  = forceKuts ks
                  . removeKutEdges ks
                  . filter isRealEdge
   where
-    ks           = givenKs `S.union` nlKs
+    ks           = givenKs `S.union` nlKs `S.union` wvarKs
     givenKs      = cutVars cfg    si
     nlKs
       | nonLinCuts cfg = nonLinearKVars si
       | otherwise      = mempty
+    -- Force w-vars into the cut set so the elimination pass never tries to
+    -- substitute them away: they are resolved by their seeded `true` solution
+    -- (Phase 1), not by elimination. This is a Phase-1 mechanism, not a claim
+    -- that w-vars are "really" cut vars. Guarded by --wvars so the k-var-only
+    -- path is unaffected.
+    wvarKs
+      | wvars cfg = S.map F.wvarKVar (F.wVars si)
+      | otherwise = mempty
 
 edgeDeps' :: Config -> [CEdge] -> Elims F.KVar
 edgeDeps' cfg es = Deps (takeK cs) (takeK ns)
