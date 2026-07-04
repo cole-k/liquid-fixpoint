@@ -34,7 +34,7 @@ module Language.Fixpoint.Solver.WVarSolve
 import qualified Data.HashMap.Strict                as M
 import qualified Data.HashSet                       as S
 import qualified Data.List                          as L
-import           Control.Monad                      (foldM, filterM)
+import           Control.Monad                      (foldM)
 import           Control.Monad.IO.Class             (liftIO)
 import           Data.IORef                         (IORef, newIORef, readIORef, modifyIORef')
 import           Language.Fixpoint.Types.Config     (Config)
@@ -53,6 +53,10 @@ type RQual = (F.KVar, Sol.EQual)
 --   currently save it. An association list (qualifiers lack a 'Hashable'
 --   instance, and the set is small).
 type Reclaimed = [(RQual, S.HashSet F.WVar)]
+
+-- | Precomputed @canSave@ results: (w-var, constraint id, Q@head) -> can w save
+--   Q on that constraint (its WP there is non-vacuous)?
+type CanSaveTbl = M.HashMap (F.WVar, F.SubcId, F.Expr) Bool
 
 -- | Identity of a reclaimed qualifier (for dedup/comparison), using the
 --   instantiated predicate which /is/ hashable/comparable.
@@ -80,15 +84,13 @@ solveWVars cfg scope fi sFinal failCs = do
       mrg (rq, ws1) (_, ws2) = (rq, S.union ws1 ws2)
   -- Run the reclaimed-qualifier fixpoint: keep only qualifiers that survive
   -- every constraint where their k-var is a head, via LHS or a saving w-var.
-  reclaimed <- fixReclaimed seed
-  -- Report: per failing head, per w-var, the WP for the reclaimed qualifiers
-  -- that w-var still saves and that make the head valid. The subset search can
-  -- backtrack; bound it by a solver-call budget so a hard head (e.g. over
-  -- uninterpreted functions) can never blow up (this only affects the
-  -- diagnostic, never the verdict).
+  -- Precompute every canSave check up front, batching all the (quantified) WP
+  -- eliminations into a *single* QE call (rather than one fresh-Z3-process spawn
+  -- per check inside the fixpoint).
+  csTbl <- precomputeCanSave seed
+  reclaimed <- fixReclaimed csTbl seed
   budget <- liftIO (newIORef (2000 :: Int))
   cands <- reportCandidates budget reclaimed
-  -- Simplify each WP conjunct with QE (fresh context; best-effort).
   let ws0 = map fst cands
       es0 = map snd cands
   es1 <- liftIO $ qeManyD cfg (symbolEnv cfg fi) (F.defns fi) es0
@@ -108,67 +110,73 @@ solveWVars cfg scope fi sFinal failCs = do
     ----------------------------------------------------------------------------
     -- The reclaimed-qualifier fixpoint (monotone: only shrinks).
     ----------------------------------------------------------------------------
-    -- The saver-survival check depends only on the fixed final solution and the
-    -- constraints (not on the reclaimed set), so a single pass already reaches
-    -- the fixpoint -- no iteration needed.
-    fixReclaimed :: Reclaimed -> SolveM a Reclaimed
-    fixReclaimed = stepReclaimed
+    fixReclaimed :: CanSaveTbl -> Reclaimed -> SolveM a Reclaimed
+    fixReclaimed csTbl = stepReclaimed csTbl
 
-    -- one pass: re-check every reclaimed qualifier against its k-var's head
-    -- constraints, shrinking savers / dropping qualifiers.
+    -- one pass over every reclaimed qualifier (idempotent: the check depends only
+    -- on the fixed final solution, so a single pass is the fixpoint).
     --
     -- The survival check uses the /real/ final solution for the LHS (not one
     -- enhanced with the reclaimed qualifiers): the reclaimed set as a whole is a
     -- union of possibilities from different w-vars and can be inconsistent, which
     -- would make an enhanced LHS false and vacuously "imply" everything.
-    stepReclaimed :: Reclaimed -> SolveM a Reclaimed
-    stepReclaimed r = do
-      updated <- mapM (recheck sFinal) r
+    stepReclaimed :: CanSaveTbl -> Reclaimed -> SolveM a Reclaimed
+    stepReclaimed csTbl r = do
+      updated <- mapM (recheck csTbl) r
       return [ (rq, ws) | (rq, ws) <- updated, not (S.null ws) ]
 
     -- re-check a single reclaimed qualifier across all its head-constraints
-    recheck :: Sol.Solution -> (RQual, S.HashSet F.WVar)
+    recheck :: CanSaveTbl -> (RQual, S.HashSet F.WVar)
             -> SolveM a (RQual, S.HashSet F.WVar)
-    recheck sol (rq@(k, _), ws0) = do
-      ws' <- foldM (survive sol rq) ws0 (headConstraints k)
+    recheck csTbl (rq@(k, _), ws0) = do
+      ws' <- foldM (survive csTbl rq) ws0 (headConstraints k)
       return (rq, ws')
 
     -- shrink the saver set for @(k, eq)@ against one head-constraint @c'@.
-    survive :: Sol.Solution -> RQual -> S.HashSet F.WVar
+    survive :: CanSaveTbl -> RQual -> S.HashSet F.WVar
             -> (F.SimpC a, F.Subst, F.TyVarSubst) -> SolveM a (S.HashSet F.WVar)
-    survive sol (_, eq) ws (c', su, tvsu) = do
+    survive csTbl (_, eq) ws (c', su, tvsu) = do
       let qHead = instantiate su tvsu eq        -- Q at this head's args
-          lhs   = So.lhsPred cfg scope F.emptyIBindEnv be sol c'
+          lhs   = So.lhsPred cfg scope F.emptyIBindEnv be sFinal c'
       impl <- isValid (cstrSpan c') lhs qHead
       if impl
         then return ws                          -- LHS proves it: all savers OK here
-        else S.fromList <$>                     -- else keep only w-vars that can prove it
-               filterM (\w -> canSave w c' lhs qHead) (S.toList ws)
+        else return $ S.fromList               -- else keep only savers that can prove it
+               [ w | w <- S.toList ws
+                   , M.lookupDefault False (csKey w c' qHead) csTbl ]
 
-    -- can w-var @w@ prove @qHead@ on @c'@? It must guard @c'@ (occur in its LHS)
-    -- can w-var @w@ prove @qHead@ on @c'@? It must guard @c'@ (occur in its LHS)
-    -- and its WP there must be non-vacuous. We eliminate the WP's quantifier with
-    -- QE first so the satisfiability check is quantifier-free (fast) instead of
-    -- relying on MBQI, which is ~0.5s per quantified query.
-    canSave :: F.WVar -> F.SimpC a -> F.Expr -> F.Expr -> SolveM a Bool
-    canSave w c' lhs qHead
-      | not (w `guards` c') = return False
-      | otherwise           = do
-          let (wp, dom) = mkWP w c' lhs qHead
-          -- Non-vacuity is decided by eliminating the WP's quantifier (QE) and a
-          -- cheap quantifier-free satisfiability check. QE runs in a datatype-
-          -- aware context, so ADT selectors are fine. If QE still cannot
-          -- eliminate the quantifier (e.g. genuinely uninterpreted functions),
-          -- conservatively keep the saver -- whether the solution really fixes a
-          -- head is re-checked at report time.
-          wp' <- liftIO (qe1 wp)
-          if hasQuant wp' then return True
-                          else satisfiable (F.pAnd [wp', dom])
+    -- | The canSave table, precomputed. Key = (w-var, constraint id, Q@head).
+    csKey :: F.WVar -> F.SimpC a -> F.Expr -> (F.WVar, F.SubcId, F.Expr)
+    csKey w c' qHead = (w, F.subcId c', qHead)
 
-    -- QE a single formula (fresh Z3 context); returns it unchanged on failure.
-    qe1 :: F.Expr -> IO F.Expr
-    qe1 e = do es <- qeManyD cfg (symbolEnv cfg fi) (F.defns fi) [e]
-               return (case es of (x:_) -> x; [] -> e)
+    -- | Precompute @canSave@ for every (reclaimed qualifier, its head-constraint,
+    --   guarding w-var) triple, batching all the WP quantifier-eliminations into
+    --   a single QE call. Then a cheap quantifier-free satisfiability check
+    --   decides non-vacuity (if QE could not eliminate, keep the saver).
+    precomputeCanSave :: Reclaimed -> SolveM a CanSaveTbl
+    precomputeCanSave r = do
+      -- enumerate the triples (only where the LHS does not already imply Q, and
+      -- w actually guards c') -- these are exactly what @survive@ will look up.
+      let triples =
+            [ (w, c', qHead, wp, dom)
+            | ((k, eq), ws) <- r
+            , (c', su, tvsu) <- headConstraints k
+            , let qHead = instantiate su tvsu eq
+            , let lhs   = So.lhsPred cfg scope F.emptyIBindEnv be sFinal c'
+            , w <- S.toList ws
+            , w `guards` c'
+            , let (wp, dom) = mkWP w c' lhs qHead
+            ]
+      -- batch-QE all the WPs at once (one fresh Z3 process, reused for all)
+      qfs <- liftIO $ qeManyD cfg (symbolEnv cfg fi) (F.defns fi) [ wp | (_,_,_,wp,_) <- triples ]
+      -- decide each with a cheap quantifier-free satisfiability check
+      entries <- mapM
+        (\((w, c', qHead, _, dom), qf) ->
+            do ok <- if hasQuant qf then return True
+                                    else satisfiable (F.pAnd [qf, dom])
+               return ((w, F.subcId c', qHead), ok))
+        (zip triples qfs)
+      return (M.fromList entries)
 
     guards :: F.WVar -> F.SimpC a -> Bool
     guards w c' = F.wvarKVar w `elem` V.envKVars be c'

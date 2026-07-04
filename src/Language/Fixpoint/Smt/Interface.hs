@@ -276,13 +276,19 @@ qeWith' declareFree tactic e =
 --   Z3's QE can reason about ADT selectors. 'qe' does /not/ self-declare here
 --   (everything is already declared), avoiding "already declared" conflicts.
 qeManyD :: Config -> SymEnv -> DefinedFuns -> [Expr] -> IO [Expr]
-qeManyD cfg env defns es = mapM one es
+qeManyD cfg env defns es =
+  -- Create ONE Z3 context (one process) populated from the SymEnv, and run QE
+  -- for every formula in it. Each 'qeWith'' call is already push/pop-isolated
+  -- ('smtBracket'), and with @declareFree=False@ it declares nothing per formula
+  -- (all symbols/datatypes come from the shared SymEnv), so reusing the context
+  -- is equivalent to a fresh context per formula -- but avoids spawning (and
+  -- tearing down) a separate Z3 process for each one, which dominates the cost.
+  bracket (makeContextWithSEnv cfg "" env defns) cleanupContext $ \ctx ->
+    evalStateT (mapM one es) ctx
   where
-    one :: Expr -> IO Expr
-    one e =
-      (bracket (makeContextWithSEnv cfg "" env defns) cleanupContext $ \ctx ->
-         evalStateT (qeWith' False qeTactic e) ctx)
-      `catch` \(_ :: SomeException) -> pure e
+    one :: Expr -> SmtM Expr
+    one e = qeWith' False qeTactic e
+              `catchSMT` \(_ :: SomeException) -> pure e
 
 -- | Run 'qe' on several formulas in a /fresh, isolated/ SMT context.
 --
