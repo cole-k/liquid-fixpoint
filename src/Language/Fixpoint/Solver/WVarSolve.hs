@@ -39,17 +39,22 @@ import           Control.Monad.IO.Class             (liftIO)
 import           Language.Fixpoint.Types.Config     (Config)
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.Types.Solutions  as Sol
+import qualified Language.Fixpoint.Types.Visitor    as V
 import           Language.Fixpoint.Solver.Monad     (SolveM, WDrop(..), getWDrops, filterValid, smtEnablembqi)
 import           Language.Fixpoint.Smt.Interface    (qeMany)
 import qualified Language.Fixpoint.Solver.Solution  as So
 
 --------------------------------------------------------------------------------
 -- | Build candidate w-var solutions from the drops captured during Phase 1.
---   Runs inside 'SolveM' (after refinement). Each per-drop WP conjunct is
---   checked for non-vacuity (satisfiability): a conjunct that is identically
---   @false@ means the w-var cannot actually rescue that qualifier (typically an
---   "ambient" w-var that guards the constraint but whose arguments don't
---   mention the variable being constrained), so it is dropped.
+--   Runs inside 'SolveM' (after refinement).
+--
+--   A captured drop is only turned into a WP if it is /relevant/: re-adding the
+--   dropped qualifier to its k-var must actually help prove one of the failing
+--   heads. This discards drops from constraints (e.g. base cases) whose
+--   qualifiers have nothing to do with the failure -- otherwise every w-var that
+--   happens to guard such a constraint would be reported with a useless (but
+--   satisfiable) "solution". Surviving conjuncts are additionally checked for
+--   non-vacuity (satisfiability with the domain) and simplified with QE.
 --------------------------------------------------------------------------------
 solveWVars
   :: forall a. (F.Loc a)
@@ -57,8 +62,9 @@ solveWVars
   -> S.HashSet F.Symbol            -- ^ scope
   -> F.SInfo a
   -> Sol.Solution                  -- ^ final solution
+  -> [F.SimpC a]                   -- ^ failing (concrete) constraints
   -> SolveM a F.WVarResult
-solveWVars cfg scope fi sFinal = do
+solveWVars cfg scope fi sFinal failCs = do
   drops <- getWDrops
   -- The non-vacuity checks below are quantified; MBQI must be on for the
   -- solver to decide them (the preamble disables it for the QF Phase-1 checks).
@@ -66,17 +72,9 @@ solveWVars cfg scope fi sFinal = do
   -- The same drop is recorded on every fixpoint iteration; dedup first (cheap,
   -- on the provenance) before building/checking WPs.
   let uniqueDrops = M.elems $ M.fromList [ (dropKey d, d) | d <- drops ]
-      cands = [ (w, wpOfDrop w d) | d <- uniqueDrops, w <- wdWVars d ]
-  -- PERF INSTRUMENTATION (kept handy, disabled): to compare the cost of the
-  -- current "non-vacuity (quantified MBQI) first" ordering against a possible
-  -- "QE first, then quantifier-free non-vacuity" ordering on bigger/harder
-  -- examples, uncomment the Debug.trace below (and its import) to see how many
-  -- drops / candidate (w,drop) pairs / quantified SMT queries we issue.
-  --
-  -- perDrop <- Debug.trace ("[WVAR-PERF] drops=" ++ show (length drops)
-  --                         ++ " uniqueDrops=" ++ show (length uniqueDrops)
-  --                         ++ " candidate (w,drop) pairs=" ++ show (length cands)) $
-  --            filterM nonVacuous cands
+  -- Keep only drops whose qualifier actually helps rescue a failing head.
+  relDrops <- filterM relevant uniqueDrops
+  let cands = [ (w, wpOfDrop w d) | d <- relDrops, w <- wdWVars d ]
   perDrop <- filterM nonVacuous cands
   -- Simplify each surviving WP conjunct with Z3 quantifier elimination, in a
   -- FRESH context (qeMany) so `(apply qe)` does not see the main solver's
@@ -90,6 +88,31 @@ solveWVars cfg scope fi sFinal = do
   where
     be = F.bs fi
     cm = F.cm fi
+
+    -- | Is this drop relevant to some failing head? I.e. does re-adding the
+    --   dropped qualifier to its k-var make a failing head (that reads that
+    --   k-var) valid, when it was not before?
+    relevant :: WDrop -> SolveM a Bool
+    relevant d = anyM (rescues d) [ c | c <- failCs, wdKVar d `elem` V.envKVars be c ]
+
+    rescues :: WDrop -> F.SimpC a -> SolveM a Bool
+    rescues d c = do
+      let sEnh = addEQual (wdKVar d) (wdEQual d) sFinal
+          lhs  = So.lhsPred cfg scope F.emptyIBindEnv be sEnh c
+          rhs  = F.crhs c
+      isValid (F.srcSpan (F.sinfo c)) lhs rhs
+
+    -- | Add an EQual to a k-var's QBind in the solution.
+    addEQual :: F.KVar -> Sol.EQual -> Sol.Solution -> Sol.Solution
+    addEQual k eq s = s { Sol.sMap = M.adjust add k (Sol.sMap s) }
+      where add (Sol.QB eqs) = Sol.QB (eq : eqs)
+
+    isValid :: F.SrcSpan -> F.Expr -> F.Expr -> SolveM a Bool
+    isValid sp p q = not . null <$> filterValid sp p [(q, ())]
+
+    anyM :: Monad m => (b -> m Bool) -> [b] -> m Bool
+    anyM _ []     = return False
+    anyM f (x:xs) = do b <- f x; if b then return True else anyM f xs
 
     -- cheap identity of a drop for deduplication
     dropKey :: WDrop -> (F.SubcId, F.KVar, F.Expr)
@@ -126,7 +149,7 @@ solveWVars cfg scope fi sFinal = do
     --   the non-vacuity check, where the raw LHS (with those variables free) is
     --   conjoined with the quantified WP.
     wpOfDrop :: F.WVar -> WDrop -> (F.Expr, F.Expr)
-    wpOfDrop w (WDrop _ cid _ qHead) =
+    wpOfDrop w (WDrop _ cid _ qHead _) =
       case M.lookup cid cm of
         Nothing -> (F.PTrue, F.PTrue)
         Just c  ->

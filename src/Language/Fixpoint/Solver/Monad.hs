@@ -84,6 +84,7 @@ data WDrop = WDrop
   , wdCid   :: !F.SubcId     -- ^ the constraint that dropped it
   , wdKVar  :: !F.KVar       -- ^ the k-var it was dropped from
   , wdHead  :: !F.Expr       -- ^ the dropped qualifier, instantiated at the head args (Q@head)
+  , wdEQual :: !F.EQual      -- ^ the dropped qualifier itself (to re-add to the k-var)
   }
 
 recordWDrops :: [WDrop] -> SolveM ann ()

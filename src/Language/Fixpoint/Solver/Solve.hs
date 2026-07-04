@@ -185,9 +185,10 @@ solve_ cfg scope fi s2 wkl = do
   -- w-var solving: only when --wvars is on and we ended up Unsafe. Builds
   -- candidate w-var solutions (WPs) from the drops captured during Phase 1.
   res2' <- case (wvars cfg, resStatus res2) of
-    (True, Unsafe _ _) -> do
+    (True, Unsafe _ bads) -> do
       liftSMT $ smtComment "solve: wvar-solve"
-      wres <- WVarSolve.solveWVars cfg scope fi s3
+      let failCs = [ c | (i,_) <- bads, Just c <- [M.lookup i (F.cm fi)] ]
+      wres <- WVarSolve.solveWVars cfg scope fi s3 failCs
       return res2 { F.resWVars = wres }
     _ -> return res2
 
@@ -308,7 +309,7 @@ refineC wVs scope bindingsInSmt be _i s c =
       | null guardWs    = return ()
       | otherwise       =
           recordWDrops
-            [ WDrop guardWs (F.subcId c) k qPred
+            [ WDrop guardWs (F.subcId c) k qPred eq
             | (qPred, eq) <- rhs, eq `notElem` kept ]
       where
         guardWs = [ F.kvarWVar wk
