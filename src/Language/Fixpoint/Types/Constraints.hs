@@ -67,11 +67,17 @@ module Language.Fixpoint.Types.Constraints (
   , FixDelayedSolution
   , Delayed (..)
   , Result (..), ResultSorts
+  , WVarFix (..), WVarResult
   , unsafe, isUnsafe, isSafe ,safe
 
   -- * Cut KVars
   , Kuts (..)
   , ksMember
+
+  -- * W-Variables (weak k-vars)
+  , WVar (..)
+  , wvarKVar
+  , kvarWVar
 
   -- * Higher Order Logic
   , HOInfo (..)
@@ -108,6 +114,7 @@ import           Data.Aeson                hiding (Result)
 import qualified Data.Set                  as Set
 import           Data.Typeable             (Typeable)
 import           Data.Hashable
+import           Data.String               (IsString)
 import           GHC.Generics              (Generic)
 import qualified Data.List                 as L -- (sort, nub, delete)
 import           Data.Maybe                (catMaybes)
@@ -262,11 +269,49 @@ instance (NFData a) => NFData (Delayed a)
 type FixSolution  = M.HashMap KVar Expr
 type FixDelayedSolution  = M.HashMap KVar (Delayed Expr)
 
+-- | Diagnostic information about how a failing (concrete) head /could/ be
+--   rescued by strengthening one or more w-variables. This is populated only
+--   when the @--wvars@ feature is on and the standard verdict is @Unsafe@; it
+--   never changes the verdict itself.
+--
+--   For v1 we report the /rescued qualifiers/ (the qualifiers that were
+--   stripped from k-vars during Phase 1 by w-guarded constraints and which,
+--   re-added, make the head valid) together with the w-var(s) responsible for
+--   them. Turning these rescued qualifiers into an actual solution for the
+--   w-var (which requires weakest-precondition reasoning, since the qualifier
+--   and the w-var generally live in different variable scopes) is left to a
+--   later phase.
+data WVarFix = WVarFix
+  { wfWVars     :: ![WVar]   -- ^ the w-var(s) held responsible for this fix
+  , wfRescued   :: ![Expr]   -- ^ the rescued qualifier predicates (instantiated)
+  }
+  deriving (Eq, Show, Generic)
+
+instance NFData   WVarFix
+instance S.Store  WVarFix
+
+instance ToJSON WVarFix where
+  toJSON (WVarFix ws qs) = object
+    [ "wvars"   .= ws
+    , "rescued" .= map (render . toHornSMT) qs
+    ]
+
+instance PPrint WVarFix where
+  pprintTidy k (WVarFix ws qs) =
+    "wvars" <+> pprintTidy k ws <+> "rescued" <+> pprintTidy k (toFix <$> qs)
+
+-- | Per failing constraint (identified by its 'SubcId'), a list of candidate
+--   fixes. See 'WVarFix'.
+type WVarResult = M.HashMap SubcId [WVarFix]
+
 data Result a = Result
   { resStatus    :: !(FixResult a)
   , resSolution  :: !FixSolution
   , resNonCutsSolution :: !FixDelayedSolution
   , resSorts     :: !ResultSorts
+  , resWVars     :: !WVarResult
+    -- ^ Diagnostic w-var fixes; only non-empty when @--wvars@ is on and the
+    --   verdict is @Unsafe@. Does not affect 'resStatus'.
   }
   deriving (Generic, Show, Functor)
 
@@ -306,6 +351,7 @@ instance ToJSON a => ToJSON (Result a) where
     [ "status"            .= resStatus
     , "solution"          .= scCuts scopedSolution
     , "nonCutsSolution"   .= scNonCuts scopedSolution
+    , "wVars"             .= M.fromList [ (show i, fs) | (i, fs) <- M.toList resWVars ]
     ]
     where
       scopedSolution = scopedResult r
@@ -323,15 +369,16 @@ instance ToJSON ScopedExpr where
   toJSON = toJSON . render . toHornSMT
 
 instance Semigroup (Result a) where
-  r1 <> r2  = Result stat soln nonCutsSoln sorts
+  r1 <> r2  = Result stat soln nonCutsSoln sorts wvars
     where
       stat  = resStatus r1    <> resStatus r2
       soln  = resSolution r1  <> resSolution r2
       nonCutsSoln = resNonCutsSolution r1 <> resNonCutsSolution r2
       sorts = M.unionWith L.union (resSorts r1) (resSorts r2)
+      wvars = M.unionWith (++) (resWVars r1) (resWVars r2)
 
 instance Monoid (Result a) where
-  mempty        = Result mempty mempty mempty mempty
+  mempty        = Result mempty mempty mempty mempty mempty
   mappend       = (<>)
 
 unsafe, safe :: Result a
@@ -660,6 +707,44 @@ foldSort' f = step
 
 
 --------------------------------------------------------------------------------
+-- | W-Variables (weak k-vars) -------------------------------------------------
+--------------------------------------------------------------------------------
+
+-- | A @WVar@ identifies a "weak" k-var (w-variable): an unknown predicate that
+--   appears only in constraint bodies (never as a head) and is solved to the
+--   /weakest/ value that keeps the system satisfiable. At the raw AST level a
+--   w-var occurrence is represented exactly like a k-var (a 'PKVar' node); the
+--   distinction between weak and ordinary k-vars is drawn solely by membership
+--   in the 'wVars' set of a 'GInfo'. This newtype exists so that every function
+--   operating on weak vars is explicit about it and cannot accidentally be
+--   handed an ordinary 'KVar'.
+newtype WVar = WV { wv :: Symbol }
+               deriving (Eq, Ord, Data, Typeable, Generic, IsString)
+
+instance Show WVar where
+  show (WV x) = "$" ++ show x
+
+instance Hashable WVar
+instance NFData   WVar
+instance S.Store  WVar
+instance ToJSON   WVar
+instance FromJSON WVar
+instance ToJSONKey WVar
+
+instance PPrint WVar where
+  pprintTidy _ (WV x) = text "$" <-> pprint x
+
+-- | Convert a 'WVar' to the 'KVar' with the same underlying symbol. Use at the
+--   boundary where a weak var must be looked up in a @KVar@-keyed structure
+--   (e.g. @ws@, @sMap@).
+wvarKVar :: WVar -> KVar
+wvarKVar = KV . wv
+
+-- | Convert a 'KVar' to a 'WVar' with the same underlying symbol.
+kvarWVar :: KVar -> WVar
+kvarWVar = WV . kv
+
+--------------------------------------------------------------------------------
 -- | Constraint Cut Sets -------------------------------------------------------
 --------------------------------------------------------------------------------
 
@@ -711,6 +796,7 @@ fi cs ws binds ls ds ks qs bi aHO aHOq es axe adts
        , ddecls   = adts
        , lrws     = mempty
        , defns    = mempty
+       , wVars    = mempty
        }
   where
     --TODO handle duplicates gracefully instead (merge envs by intersect?)
@@ -756,6 +842,7 @@ data GInfo c a = FI
   , ae       :: AxiomEnv                   -- ^ Information about reflected function defs
   , lrws     :: LocalRewritesEnv           -- ^ Local rewrites
   , defns    :: DefinedFuns                -- ^ `define_fun` definitions to be passed to SMT
+  , wVars    :: !(S.HashSet WVar)          -- ^ Which of the KVars in `ws` are weak (w-variables)
   }
   deriving (Eq, Show, Functor, Generic)
 
@@ -782,6 +869,7 @@ instance Semigroup (GInfo c a) where
                 , ae       = ae i1       <> ae i2
                 , lrws     = lrws i1     <> lrws i2
                 , defns    = defns i1    <> defns i2
+                , wVars    = wVars i1    <> wVars i2
                 }
 
 
@@ -800,6 +888,7 @@ instance Monoid (GInfo c a) where
                      , ae       = mempty
                      , lrws     = mempty
                      , defns    = mempty
+                     , wVars    = mempty
                      }
 
 instance PTable (SInfo a) where

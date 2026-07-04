@@ -1402,7 +1402,7 @@ boolP = (reserved "True" >> return True)
     <|> (reserved "False" >> return False)
 
 defsFInfo :: [Def a] -> FInfo a
-defsFInfo defs = {- SCC "defsFI" -} Types.FI cm ws bs lts dts kts qs binfo adts mempty mempty ae lrws mempty
+defsFInfo defs = {- SCC "defsFI" -} Types.FI cm ws bs lts dts kts qs binfo adts mempty mempty ae lrws mempty mempty
   where
     cm         = Misc.safeFromList
                    "defs-cm"        [(cid c, c)         | Cst c       <- defs]

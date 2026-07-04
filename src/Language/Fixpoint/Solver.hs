@@ -193,7 +193,7 @@ solveNative !cfg !fi0 = solveNative' cfg fi0
                              (return . crashResultOther . wrapExceptionWithContext)
 
 crashResult :: (PPrint a) => ErrorMap a -> ExceptionWithContext Error -> Result (Integer, a)
-crashResult m (ExceptionWithContext ectx ex) = Result res mempty mempty mempty
+crashResult m (ExceptionWithContext ectx ex) = Result res mempty mempty mempty mempty
   where
     res = Crash es msg
     es  = catMaybes [ findError m e | e <- ers ]
@@ -206,7 +206,7 @@ crashResult m (ExceptionWithContext ectx ex) = Result res mempty mempty mempty
 crashResultOther
   :: ExceptionWithContext SomeException -> Result (Integer, a)
 crashResultOther (ExceptionWithContext ectx ex) =
-    Result res mempty mempty mempty
+    Result res mempty mempty mempty mempty
   where
     res = Crash [] msg
     msg = displayExceptionContext ectx ++ "\n" ++ msg0

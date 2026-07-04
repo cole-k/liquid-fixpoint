@@ -303,7 +303,7 @@ result scope bindingsInSmt cfg fi cs s =
     resCut    <- solResult cfg s
     let resNonCut = S.nonCutsResult cfg scope be s
         resSorts = resultSorts fi (M.keys resCut ++ M.keys resNonCut) be
-    return     $ F.Result (ci <$> stat) resCut resNonCut resSorts
+    return     $ F.Result (ci <$> stat) resCut resNonCut resSorts mempty
   where
     ci c = (F.subcId c, F.sinfo c)
     be = F.bs fi
