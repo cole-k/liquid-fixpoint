@@ -30,10 +30,14 @@ hornFInfo cfg q = mempty
   , F.hoInfo    = F.cfgHoInfo cfg
   , F.defns     = F.MkDefinedFuns (H.qDefs q)
   , F.kuts      = F.KS (S.fromList (H.qKuts q))
+  , F.wVars     = S.fromList [ F.kvarWVar (F.KV (H.hvName w)) | w <- H.qWVars q ]
   }
   where
     be0         = F.emptyBindEnv
-    (be1, kve)  = hornWfs   be0     (H.qVars q)
+    -- Both ordinary kvars and w-vars get WfC entries + a KVEnv entry, so that
+    -- w-var occurrences are turned into PKVar nodes exactly like kvars. Which
+    -- of them are weak is recorded separately in `F.wVars`.
+    (be1, kve)  = hornWfs   be0     (H.qVars q ++ H.qWVars q)
     (be2, cs) = hornSubCs be1 kve hCst
     hCst           = H.qCstr q
 

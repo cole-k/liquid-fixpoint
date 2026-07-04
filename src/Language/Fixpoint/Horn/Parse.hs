@@ -128,6 +128,7 @@ mkQuery :: [HThing a] -> H.Query a
 mkQuery things = H.Query
   { H.qQuals =              [ q     | HQual q  <- things ]
   , H.qVars  =              [ k     | HVar  k  <- things ]
+  , H.qWVars =              [ k     | HWVar k  <- things ]
   , H.qCstr  = H.CAnd       [ c     | HCstr c  <- things ]
   , H.qCon   = M.fromList   [ (x,t) | HCon x t <- things ]
   , H.qDis   = M.fromList   [ (x,t) | HDis x t <- things ]
@@ -146,6 +147,7 @@ mkQuery things = H.Query
 data HThing a
   = HQual !F.Qualifier
   | HVar  !(H.Var a)
+  | HWVar !(H.Var a)
   | HCstr !(H.Cstr a)
 
   -- for uninterpred functions and ADT constructors
@@ -166,6 +168,7 @@ hThingP  = spaces >> parens body
     body =  HQual <$> (reserved "qualif"     *> hQualifierP)
         <|> HCstr <$> (reserved "constraint" *> hCstrP)
         <|> HVar  <$> (reserved "var"        *> hVarP)
+        <|> HWVar <$> (reserved "wvar"       *> hVarP)
         <|> HOpt  <$> (reserved "fixpoint"   *> stringLiteral)
         <|> HCon  <$> (reserved "constant"   *> symbolP) <*> sortP
         <|> HDis  <$> (reserved "distinct"   *> symbolP) <*> sortP

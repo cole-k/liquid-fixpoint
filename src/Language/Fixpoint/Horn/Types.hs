@@ -196,6 +196,7 @@ okCstr _      = False
 data Query a = Query
   { qQuals :: ![F.Qualifier]             -- ^ qualifiers over which to solve cstrs
   , qVars  :: ![Var a]                   -- ^ kvars, with parameter-sorts
+  , qWVars :: ![Var a]                   -- ^ w-vars (weak kvars), with parameter-sorts
   , qCstr  :: !(Cstr a)                  -- ^ list of constraints
   , qCon   :: M.HashMap F.Symbol F.Sort  -- ^ list of constants (un/interpreted functions)
   , qDis   :: M.HashMap F.Symbol F.Sort  -- ^ list of *distinct* constants (uninterpreted functions)
