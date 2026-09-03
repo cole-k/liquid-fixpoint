@@ -201,7 +201,8 @@ smtEnablembqi
 --------------------------------------------------------------------------------
 assumesAxioms :: [F.Triggered F.Expr] -> SolveM ann ()
 --------------------------------------------------------------------------------
-assumesAxioms es = liftSMT $ forM_ es smtAssertAxiom
+assumesAxioms es = do
+  liftSMT $ forM_ es smtAssertAxiom
 
 
 ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ module Language.Fixpoint.Solver.Eliminate ( solverInfo ) where
 import qualified Data.HashSet        as S
 import qualified Data.HashMap.Strict as M
 
-import           Language.Fixpoint.Types.Config    (Config)
+import           Language.Fixpoint.Types.Config    (Config (allKVarsCut))
 import qualified Language.Fixpoint.Types.Solutions as Sol
 import           Language.Fixpoint.Types
 import           Language.Fixpoint.Types.Visitor   (kvarsExpr, isConcC)
@@ -33,9 +33,11 @@ import           Language.Fixpoint.Misc            (safeLookup, group, errorstar
 {-# SCC solverInfo #-}
 solverInfo :: Config -> SInfo a -> SolverInfo a
 --------------------------------------------------------------------------------
-solverInfo cfg sI = SI sHyp sI' cD cKs
+solverInfo cfg sI
+  | allKVarsCut cfg = SI mempty sI cD allKs
+  | otherwise       = SI sHyp sI' cD cKs
   where
-    cD             = elimDeps     sI es nKs
+    cD             = elimDeps     sI es eliminatedKs
     sI'            = cutSInfo     sI kI cKs
     sHyp = Sol.Sol
       { Sol.sMap = mempty
@@ -46,6 +48,10 @@ solverInfo cfg sI = SI sHyp sI' cD cKs
     kI             = kIndex       sI
     (es, cKs, nKs) = kutVars cfg  sI
     kS             = kvScopes     sI es
+    allKs          = S.fromList (M.keys (ws sI))
+    eliminatedKs
+      | allKVarsCut cfg = mempty
+      | otherwise       = nKs
 
 --------------------------------------------------------------------------------
 -- | For each KVar, provide the intersection of the binding environments

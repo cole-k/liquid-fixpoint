@@ -27,8 +27,11 @@ import qualified Language.Fixpoint.Solver.Solution  as S
 import qualified Language.Fixpoint.Smt.Types as T
 import qualified Language.Fixpoint.Solver.Worklist  as W
 import qualified Language.Fixpoint.Solver.Eliminate as E
+import qualified Language.Fixpoint.Types.Visitor as V
+import           Language.Fixpoint.Types.Visitor (isConcC)
 import           Language.Fixpoint.Solver.Monad
 import           Language.Fixpoint.Utils.Progress
+import           Language.Fixpoint.Utils.Files (Ext (KVars, Sccs))
 import           Language.Fixpoint.Graph
 import           Text.PrettyPrint.HughesPJ
 import           Text.Printf
@@ -43,6 +46,7 @@ import Language.Fixpoint.Smt.Interface (smtComment)
 import Language.Fixpoint.Solver.Interpreter (instInterpreter)
 import qualified Language.Fixpoint.Solver.PLE as PLE      (instantiate)
 import Data.Maybe (maybeToList)
+import System.IO (hFlush, stdout)
 
 mytrace :: String -> a -> a
 mytrace
@@ -65,9 +69,13 @@ solve
 --------------------------------------------------------------------------------
 
 solve cfg elabParam scope fi = do
-    whenLoud $ donePhase Misc.Loud "Worklist Initialize"
+    tracePhase cfg "classify KVars and initialize worklist"
+    dumpKVars cfg sI
+    dumpSccGraph cfg sI
+    tracePhase cfg "initialize SMT and start refinement"
     vb <- getVerbosity
     (res, stat) <- (if Quiet == vb then id else withProgressFI sI) $ runSolverM cfg sI elabParam act
+    tracePhase cfg "solver complete"
     when (solverStats cfg) $ printStats fi wkl stat
     -- print (numIter stat)
     return res
@@ -84,7 +92,13 @@ solve cfg elabParam scope fi = do
     -- S.init provides an initial solution for the cut KVars
     sI  = solverInfo cfg fi
     wkl = W.init sI
-    s0  = (siSol sI) { Sol.sMap = S.init cfg fi ks }
+    s0  = (siSol sI)
+      { Sol.sMap = M.union forced (S.init cfg fi (S.difference ks forcedKs))
+      , Sol.sHyp = M.filterWithKey (\k _ -> not (S.member k forcedKs)) (Sol.sHyp (siSol sI))
+      }
+    forced = M.fromList [(k, Sol.QB [Sol.trueEqual]) | k <- S.toList forcedKs]
+    forcedKs = S.filter (\k -> F.kv k `S.member` forcedNames) (S.fromList (M.keys (F.ws fi)))
+    forcedNames = S.fromList (forceKVars cfg)
     ks  = siVars sI
     elabQBind ctx msg env (Sol.QB xs) = Sol.QB (map elabEQual xs)
       where
@@ -93,8 +107,99 @@ solve cfg elabParam scope fi = do
                 elaborate
                  (ElabParam (T.ctxElabF ctx) (F.atLoc F.dummySpan msg) env)
                  (Sol.eqPred eq)
-             }
+              }
 
+dumpKVars :: Config -> SolverInfo a -> IO ()
+dumpKVars cfg sI = when (dumpKvars cfg) $ do
+  let file = queryFile KVars cfg
+      cuts = S.toList (siVars sI)
+      nonCuts = M.keys (Sol.sHyp (siSol sI))
+      contents = unlines
+        (["cut " ++ show k | k <- cuts] ++ ["non-cut " ++ show k | k <- nonCuts])
+  ensurePath file
+  putStrLn $ "Saving KVar classification: " ++ file
+  writeFile file contents
+  hFlush stdout
+
+dumpSccGraph :: Config -> SolverInfo a -> IO ()
+dumpSccGraph cfg sI = do
+  traceSccs cfg sI
+  when (dumpSccs cfg) $ do
+    let file = queryFile Sccs cfg
+    ensurePath file
+    putStrLn $ "Saving SCC dependency graph: " ++ file
+    writeFile file (sccGraph sI)
+    hFlush stdout
+
+traceSccs :: Config -> SolverInfo a -> IO ()
+traceSccs cfg sI = when (traceSolver cfg) $ do
+  let sccs = sccConstraints sI
+  putStrLn $ "  SCC scheduler: " ++ show (cNumScc (siDeps sI)) ++ " ranks; "
+    ++ show (length sccs) ++ " contain worklist constraints"
+  mapM_ putStrLn
+    [ "  SCC " ++ show number ++ " (rank " ++ show rank ++ "): " ++ show (length cs) ++ " constraints, "
+        ++ show (S.size ks) ++ " KVars"
+    | (number, (rank, cs)) <- zip [1 :: Int ..] sccs
+    , let ks = sccKVars cs
+    ]
+
+sccGraph :: SolverInfo a -> String
+sccGraph sI = unlines $
+  ["digraph SCCs {", "  rankdir=LR;"]
+  ++ concat
+    [ [ "  subgraph cluster_" ++ show number ++ " {"
+      , "    label=\"SCC " ++ show number ++ " (rank " ++ show rank ++ "): " ++ show (length cs)
+          ++ " constraints, " ++ show (S.size ks) ++ " KVars\";"
+      ]
+      ++ ["    " ++ kvarNode k ++ ";" | k <- L.sortOn show (S.toList ks)]
+      ++ ["  }"]
+    | (number, (rank, cs)) <- zip [1 :: Int ..] (sccConstraints sI)
+    , let ks = sccKVars cs
+    ]
+  ++ [ "  " ++ kvarNode from ++ " -> " ++ kvarNode to ++ ";"
+     | (from, to) <- kvarEdges sI
+     , S.member from refinementKVars
+     , S.member to refinementKVars
+     ]
+  ++ ["}"]
+  where
+    refinementKVars = S.unions [sccKVars cs | (_, cs) <- sccConstraints sI]
+
+sccConstraints :: SolverInfo a -> [(Int, [F.SimpC a])]
+sccConstraints sI =
+  [ (rank, cs)
+  | (rank, cs) <- L.sortOn fst (M.toList grouped)
+  ]
+  where
+    query = siQuery sI
+    grouped = M.fromListWith (++)
+      [ (rScc (lookupCMap (cRank (siDeps sI)) i), [c])
+      | (i, c) <- M.toList (F.cm query)
+      , not (isConcC c)
+      ]
+
+sccKVars :: [F.SimpC a] -> S.HashSet F.KVar
+sccKVars = S.fromList . concatMap V.rhsKVars
+
+kvarEdges :: SolverInfo a -> [(F.KVar, F.KVar)]
+kvarEdges sI = S.toList . S.fromList $
+  [ (input, output)
+  | c <- M.elems (F.cm query)
+  , output <- V.rhsKVars c
+  , input <- V.envKVars (F.bs query) c
+  ]
+  where
+    query = siQuery sI
+
+kvarNode :: F.KVar -> String
+kvarNode k = "\"" ++ concatMap escape (show k) ++ "\""
+  where
+    escape '\"' = "\\\""
+    escape '\\' = "\\\\"
+    escape c    = [c]
+
+tracePhase :: Config -> String -> IO ()
+tracePhase cfg phase = when (traceSolver cfg) $ startPhase Misc.Loud phase >> hFlush stdout
 
 --------------------------------------------------------------------------------
 -- | Progress Bar
@@ -137,23 +242,26 @@ solve_ cfg scope fi s2 wkl = do
   liftSMT $ smtComment "solve: start"
   (s3, res0) <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bindingsInSmt -> do
     -- let s3   = solveEbinds fi s2
-    s3       <- {- SCC "sol-refine" -} refine scope bindingsInSmt (F.bs fi) s2 wkl
-    res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg fi (W.unsatCandidates wkl) s3
+    (s3, usedNonCuts) <- {- SCC "sol-refine" -} refine scope bindingsInSmt (F.bs fi) s2 wkl
+    lift $ tracePhase cfg "refinement complete; validate constraints"
+    res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg fi (W.unsatCandidates wkl) s3 usedNonCuts
     return (s3, res0)
 
   (fi1, res1) <- case resStatus res0 of  {- first run the interpreter -}
     Unsafe _ bads | rewriteAxioms cfg && interpreter cfg -> do
+      lift $ tracePhase cfg "run interpreter"
       liftSMT $ smtComment "solve: interpreter"
       bs <- doInterpret cfg fi (map fst $ mytrace ("before the Interpreter " ++ show (length bads) ++ " constraints remain") bads)
       let fi1 = fi { F.bs = bs }
           badCs = lookupCMap (F.cm fi) <$> map fst bads
       liftSMT $ smtComment "solve: pos-interpreter check"
       fmap (fi1,) $ sendConcreteBindingsToSMT F.emptyIBindEnv bs $ \bindingsInSmt ->
-        result scope bindingsInSmt cfg fi1 badCs s3
+        result scope bindingsInSmt cfg fi1 badCs s3 mempty
     _ -> return  (fi, mytrace "all checked before interpreter" res0)
 
   res2  <- case resStatus res1 of  {- then run normal PLE on remaining unsolved constraints -}
     Unsafe _ bads2 | rewriteAxioms cfg -> do
+      lift $ tracePhase cfg "run PLE"
       when (save cfg) $
         liftIO $ S.saveSolution cfg ".pre-ple" res1
       liftSMT $ smtComment "solve: ple"
@@ -163,7 +271,7 @@ solve_ cfg scope fi s2 wkl = do
           badsCs2 = lookupCMap (F.cm fi) <$> map fst bads2
       liftSMT $ smtComment "solve: pos-ple check"
       sendConcreteBindingsToSMT F.emptyIBindEnv bs $ \bindingsInSmt ->
-        result scope bindingsInSmt cfg fi2 badsCs2 s3
+        result scope bindingsInSmt cfg fi2 badsCs2 s3 mempty
     _ -> return $ mytrace "all checked with interpreter" res1
 
   liftSMT $ smtComment "solve: finished"
@@ -226,19 +334,23 @@ refine
   -> F.BindEnv a
   -> Sol.Solution
   -> W.Worklist a
-  -> SolveM a Sol.Solution
+   -> SolveM a (Sol.Solution, S.HashSet F.KVar)
 --------------------------------------------------------------------------------
-refine scope bindingsInSmt be0 s0 w0 = go be0 s0 w0
+refine scope bindingsInSmt be0 s0 w0 = go be0 s0 w0 mempty
   where
-    go :: F.BindEnv a -> Sol.Solution -> W.Worklist a -> SolveM a Sol.Solution
-    go be s w
+    go :: F.BindEnv a -> Sol.Solution -> W.Worklist a -> S.HashSet F.KVar -> SolveM a (Sol.Solution, S.HashSet F.KVar)
+    go be s w used
       | Just (c, w', newScc, rnk) <- W.pop w = do
-         i       <- tickIter newScc
-         (b, s') <- refineC scope bindingsInSmt be i s c
-         lift $ writeLoud $ refineMsg i c b rnk (showpp s')
-         let w'' = if b then W.push c w' else w'
-         go be s' w''
-      | otherwise = return s
+          i       <- tickIter newScc
+          cfg     <- T.config <$> getContext
+          lift $ when (newScc && traceSolver cfg) $
+            putStrLn $ "  Refining SCC rank " ++ show rnk ++ ", constraint " ++ show (F.subcId c)
+          (b, s') <- refineC scope bindingsInSmt be i s c
+          lift $ writeLoud $ refineMsg i c b rnk (showpp s')
+          let w'' = if b then W.push c w' else w'
+              used' = S.union used (S.fromList (V.envKVars be c))
+          go be s' w'' used'
+      | otherwise = return (s, used)
       where
         -- DEBUG
         refineMsg i c b rnk s = printf "\niter=%d id=%d change=%s rank=%d s=%s\n"
@@ -259,16 +371,19 @@ refineC
   -> SolveM a (Bool, Sol.Solution)
 ---------------------------------------------------------------------------
 refineC scope bindingsInSmt be _i s c =
-  do let krhs = rhsCands s
-     cfg <- T.config <$> getContext
+  do cfg <- T.config <$> getContext
+     let krhs = filter (not . isForced cfg . fst) (rhsCands s)
      if all (null . snd) krhs
         then return (False, s)
         else do
           let lhs = S.lhsPred cfg scope bindingsInSmt be s c
+          lift $ when (traceSolver cfg) $
+            putStrLn $ "  SMT refinement check for constraint " ++ show (F.subcId c)
           kqs <- forM krhs $ \(k, rhs) ->
             (,) k . Sol.QB <$> filterValid (cstrSpan c) lhs rhs
           return $ S.update s kqs
   where
+    isForced cfg' k = F.kv k `S.member` S.fromList (forceKVars cfg')
     rhsCands :: Sol.Solution -> [(F.KVar, Sol.Cand Sol.EQual)]
     rhsCands s = M.toList $ M.fromList $ map cnd ks
       where
@@ -290,23 +405,40 @@ result
   => S.HashSet F.Symbol
   -> F.IBindEnv
   -> Config
-  -> F.SInfo a
-  -> [F.SimpC a]
-  -> Sol.Solution
-  -> SolveM a (F.Result (Integer, a))
+   -> F.SInfo a
+   -> [F.SimpC a]
+   -> Sol.Solution
+   -> S.HashSet F.KVar
+   -> SolveM a (F.Result (Integer, a))
 --------------------------------------------------------------------------------
-result scope bindingsInSmt cfg fi cs s =
+result scope bindingsInSmt cfg fi cs s usedNonCuts =
   sendConcreteBindingsToSMT bindingsInSmt be $ \bindingsInSmt2 -> do
     lift       $ writeLoud "Computing Result"
-    stat      <- result_ scope bindingsInSmt2 be cfg cs s
+    let sCheck = if usedNonCutResult cfg then usedSolution s usedNonCuts else s
+    stat      <- result_ scope bindingsInSmt2 be cfg cs sCheck
     lift       $ whenLoud $ putStrLn $ "RESULT: " ++ show (F.sid <$> stat)
-    resCut    <- solResult cfg s
-    let resNonCut = S.nonCutsResult cfg scope be s
-        resSorts = resultSorts fi (M.keys resCut ++ M.keys resNonCut) be
-    return     $ F.Result (ci <$> stat) resCut resNonCut resSorts
+    if skipResultSolution cfg
+      then return $ F.Result (ci <$> stat) mempty mempty mempty
+      else do
+        resCut <- solResult cfg s
+        let resNonCut = nonCutsResult cfg scope be s usedNonCuts
+            resSorts = resultSorts fi (M.keys resCut ++ M.keys resNonCut) be
+        return $ F.Result (ci <$> stat) resCut resNonCut resSorts
   where
     ci c = (F.subcId c, F.sinfo c)
     be = F.bs fi
+
+    nonCutsResult cfg' scope' be' sol used
+      | usedNonCutResult cfg' = M.filterWithKey (\k _ -> S.member k used)
+          (S.nonCutsResult cfg' scope' be' sol)
+      | otherwise = S.nonCutsResult cfg' scope' be' sol
+
+    usedSolution sol used = sol
+      { Sol.sMap = M.union (M.fromList
+          [(k, Sol.QB [Sol.trueEqual]) | k <- M.keys (Sol.sHyp sol), not (S.member k used)])
+          (Sol.sMap sol)
+      , Sol.sHyp = M.filterWithKey (\k _ -> S.member k used) (Sol.sHyp sol)
+      }
 
 resultSorts :: F.SInfo a -> [F.KVar] -> F.BindEnv a -> F.ResultSorts
 resultSorts fi ks be = M.fromList
@@ -339,11 +471,22 @@ result_
   -> Sol.Solution
   -> SolveM a (F.FixResult (F.SimpC a))
 result_ scope bindingsInSmt be cfg cs0 s = do
-  unsatisfiedConstraints <- filterM (isUnsat scope bindingsInSmt be s) cs
+  unsatisfiedConstraints <- if skipResultCheck cfg || skipResultSolution cfg
+    then pure []
+    else if fastResultCheck cfg
+      then do
+        fastFailures <- check sFast cs
+        check s fastFailures
+      else check s cs
   sts      <- stats
   pure $ res sts unsatisfiedConstraints
   where
     cs          = isChecked cfg cs0
+    check sol   = filterM (isUnsat scope bindingsInSmt be sol)
+    sFast       = s { Sol.sMap = M.union fastCuts (Sol.sMap s)
+                    , Sol.sHyp = mempty
+                    }
+    fastCuts    = M.fromList [(k, Sol.QB [Sol.trueEqual]) | k <- M.keys (Sol.sHyp s)]
     res sts []  = F.Safe sts
     res sts cs' = F.Unsafe sts cs'
 

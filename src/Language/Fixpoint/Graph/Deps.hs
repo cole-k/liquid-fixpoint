@@ -327,7 +327,7 @@ edgeDeps cfg si  = forceKuts ks
                  . edgeDeps' cfg
                  . removeKutEdges ks
                  . filter isRealEdge
-  where
+   where
     ks           = givenKs `S.union` nlKs
     givenKs      = cutVars cfg    si
     nlKs

@@ -47,6 +47,7 @@ import System.Exit                   (exitFailure, exitSuccess)
 
 import qualified Language.Fixpoint.Conditional.Z3 as Conditional.Z3
 import Language.Fixpoint.Utils.Files
+import Language.Fixpoint.Types.Names (Symbol, symbol)
 import Development.GitRev (gitHash)
 import Data.Version (showVersion)
 import Paths_liquid_fixpoint (version)
@@ -78,6 +79,11 @@ data Config = Config
   , smtTimeout  :: Maybe Int           -- ^ smt timeout in msec
   , elimStats   :: Bool                -- ^ print eliminate stats
   , solverStats :: Bool                -- ^ print solver stats
+  , skipResultCheck :: Bool            -- ^ skip final constraint validation
+  , skipResultSolution :: Bool         -- ^ skip final solution materialization
+  , fastResultCheck :: Bool            -- ^ validate with non-cut KVars replaced by true first
+  , usedNonCutResult :: Bool           -- ^ retain only non-cut KVars seen during refinement
+  , forceKVars       :: [Symbol]       -- ^ KVars to treat as true and skip during refinement
   , metadata    :: Bool                -- ^ print meta-data associated with constraints
   , stats       :: Bool                -- ^ compute constraint statistics
   , parts       :: Bool                -- ^ partition FInfo into separate fq files
@@ -109,6 +115,10 @@ data Config = Config
   , noStringTheory :: Bool             -- ^ disable interpretation of string theory by SMT
   , explicitKvars  :: Bool             -- ^ use explicitly declared kvars (horn style) which disables several "defensive simplifications"
   , sortedSolution :: Bool             -- ^ leave sorts in the solution
+  , traceSolver  :: Bool                -- ^ print coarse-grained solver phase boundaries
+  , dumpKvars    :: Bool                -- ^ write cut/non-cut KVar classification before solving
+  , dumpSccs     :: Bool                -- ^ write SCC dependency graph before solving
+  , allKVarsCut  :: Bool                -- ^ refine every KVar instead of eliminating non-cuts
   , saveDir        :: Maybe FilePath    -- ^ output directory for --save generated files (default: .liquid/ next to source)
   } deriving (Eq,Show,Generic)
 
@@ -225,6 +235,11 @@ defConfig = Config
   , smtTimeout         = Nothing
   , elimStats          = False
   , solverStats        = False
+  , skipResultCheck    = False
+  , skipResultSolution = False
+  , fastResultCheck    = False
+  , usedNonCutResult   = False
+  , forceKVars         = []
   , save               = False
   , saveBfqOnError     = False
   , saveDir            = Nothing
@@ -258,6 +273,10 @@ defConfig = Config
   , restOrdering       = "rpo"
   , explicitKvars      = False
   , sortedSolution     = False
+  , traceSolver        = False
+  , dumpKvars          = False
+  , dumpSccs           = False
+  , allKVarsCut        = False
   }
 
 -- | An individual parsed flag (modifier to Config, verbosity change, or exit).
@@ -311,6 +330,16 @@ fxOptions =
       "(alpha) Print eliminate stats"
   , opt0 "solver-stats"            (\c -> c { solverStats   = True })
       "Print solver stats"
+  , opt0 "skip-result-check"       (\c -> c { skipResultCheck = True })
+      "Skip final constraint validation"
+  , opt0 "skip-result-solution"    (\c -> c { skipResultSolution = True })
+      "Skip final solution materialization"
+  , opt0 "fast-result-check"        (\c -> c { fastResultCheck = True })
+      "Check targets with non-cut KVars replaced by true first"
+  , opt0 "used-noncut-result"       (\c -> c { usedNonCutResult = True })
+      "Use only non-cut KVars seen during refinement"
+  , Option [] ["force-kvar"]         (ReqArg (\name -> FxMod $ \c -> c { forceKVars = forceKVars c ++ [symbol name] }) "NAME")
+      "Treat this KVar as true and skip solving it (repeatable)"
   , opt0 "save"                    (\c -> c { save          = True })
       "Save Query as .fq and .bfq files"
   , Option [] ["save-bfq-on-error"] (NoArg (FxMod $ \c -> c { saveBfqOnError = True }))
@@ -378,6 +407,14 @@ fxOptions =
       "Use explicitly declared kvars (horn style) which disables several defensive simplifications"
   , opt0 "sorted-solution"         (\c -> c { sortedSolution = True })
       "Leave elaborated sorts in the solution (only for machine consumption)"
+  , opt0 "trace"                   (\c -> c { traceSolver = True })
+      "Print coarse-grained solver phase boundaries without verbose solver output"
+  , opt0 "dump-kvars"              (\c -> c { dumpKvars = True })
+      "Write cut/non-cut KVar classification to .kvars before solving"
+  , opt0 "dump-sccs"               (\c -> c { dumpSccs = True })
+      "Write compact KVar dependency graph, clustered by solver SCC, to .sccs.dot"
+  , opt0 "all-kvars-cut"           (\c -> c { allKVarsCut = True })
+      "Refine every KVar; do not eliminate non-cut KVars"
   , Option "v" ["verbose"]         (NoArg (FxVerbosity Loud))
       "Be more verbose"
   , Option "q" ["quiet"]           (NoArg (FxVerbosity Quiet))

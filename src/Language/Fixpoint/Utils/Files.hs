@@ -96,7 +96,9 @@ data Ext = Cgi      -- ^ Constraint Generation Information
          | HJSON    -- ^ Horn query JSON file
          | Min      -- ^ filter constraints with delta debug
          | MinQuals -- ^ filter qualifiers with delta debug
-         | MinKVars -- ^ filter kvars with delta debug
+          | MinKVars -- ^ filter kvars with delta debug
+          | KVars    -- ^ cut/non-cut KVar classification
+          | Sccs     -- ^ KVar dependency graph grouped by SCC
          deriving (Eq, Ord, Show)
 
 extMap :: Ext -> FilePath
@@ -135,6 +137,8 @@ extMap          = go
     go Min      = ".minfq"
     go MinQuals = ".minquals"
     go MinKVars = ".minkvars"
+    go KVars    = ".kvars"
+    go Sccs     = ".sccs.dot"
     -- go _      = errorstar $ "extMap: Unknown extension " ++ show e
 
 withExt         :: FilePath -> Ext -> FilePath

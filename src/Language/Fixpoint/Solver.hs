@@ -63,15 +63,19 @@ import qualified Data.ByteString as B
 import qualified Data.HashSet as HS
 import Data.Maybe (catMaybes)
 import qualified Text.PrettyPrint.HughesPJ as PJ
+import System.IO (hFlush, stdout)
 
 ---------------------------------------------------------------------------
 -- | Solve an .fq file ----------------------------------------------------
 ---------------------------------------------------------------------------
 solveFQ :: Config -> IO ExitCode
 solveFQ cfg = do
+    tracePhase cfg "read query"
     (fi, opts) <- readFInfo file
+    tracePhase cfg "apply query pragmas"
     cfg'       <- withPragmas cfg opts
     let fi'     = ignoreQualifiers cfg' fi
+    tracePhase cfg' "solve query"
     r          <- solve cfg' fi'
     resultExitCode cfg (fst <$> r)
   where
@@ -284,9 +288,12 @@ reduceFInfo cfg fi = do
     return reducedFi
 
 solveNative' !cfg !fi0 = do
+  tracePhase cfg "preprocess constraints"
   (elabParam, si6) <- simplifyFInfo cfg fi0
+  tracePhase cfg "start worklist solver"
   let scope = sInfoScope cfg si6
   res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si6
+  tracePhase cfg "simplify solver result"
   let res = simplifyResult cfg scope res0
   -- rnf soln `seq` donePhase Loud "Solve2"
   --let stat = resStatus res
@@ -295,6 +302,9 @@ solveNative' !cfg !fi0 = do
   -- writeLoud $ "\nSolution:\n"  ++ showpp (resSolution res)
   -- colorStrLn (colorResult stat) (show stat)
   return res
+
+tracePhase :: Config -> String -> IO ()
+tracePhase cfg phase = when (traceSolver cfg) $ startPhase Loud phase >> hFlush stdout
 
 --------------------------------------------------------------------------------
 -- | Scope ---------------------------------------------------------------------
