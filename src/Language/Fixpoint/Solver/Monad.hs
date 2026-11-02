@@ -15,6 +15,8 @@ module Language.Fixpoint.Solver.Monad
          -- * SMT Query
        , filterRequired
        , filterValid
+       , filterValidStats
+       , FilterStats(..)
        , smtEnablembqi
        , sendConcreteBindingsToSMT
 
@@ -56,6 +58,8 @@ import qualified Data.HashMap.Strict as M
 import           Data.Maybe (catMaybes)
 import           Control.Exception.Base (bracket)
 import Language.Fixpoint.SortCheck (ElabParam)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.IO (hFlush, stdout)
 
 --------------------------------------------------------------------------------
 -- | Solver Monadic API --------------------------------------------------------
@@ -83,9 +87,22 @@ runSolverM cfg sI elabParam act =
     return (fst res)
   where
     s0 ctx   = SS ctx (stats0 fi) elabParam
-    act'     = assumesAxioms (F.asserts fi) >> act
+    act'     = do
+      t0 <- liftIO getMonotonicTimeNSec
+      assumesAxioms (F.asserts fi)
+      t1 <- liftIO getMonotonicTimeNSec
+      liftIO $ reportTime "global_axioms" t0 t1
+      act
     release  = cleanupContext
-    acquire  = makeContextWithSEnv cfg file initEnv (F.defns fi)
+    acquire  = do
+      t0 <- getMonotonicTimeNSec
+      ctx <- makeContextWithSEnv cfg file initEnv (F.defns fi)
+      t1 <- getMonotonicTimeNSec
+      reportTime "smt_context_init" t0 t1
+      pure ctx
+    reportTime phase t0 t1 = when (C.traceSolver cfg) $ do
+      putStrLn $ "PHASE_TIME phase=" ++ phase ++ " elapsed_ns=" ++ show (t1 - t0)
+      hFlush stdout
     initEnv  = symbolEnv cfg fi
     file     = C.srcFile cfg
     -- only linear arithmetic when: linear flag is on or solver /= Z3
@@ -174,25 +191,44 @@ filterRequired = error "TBD:filterRequired"
 {-# SCC filterValid #-}
 filterValid :: F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann [a]
 --------------------------------------------------------------------------------
-filterValid sp p qs = do
-  qs' <- liftSMT $
-           smtBracket "filterValidLHS" $
-             filterValid_ sp p qs
+filterValid sp p qs = fst <$> filterValidStats sp p qs
+
+data FilterStats = FilterStats
+  { fsLhsAssertNs :: !Integer
+  , fsRhsAssertNs :: !Integer
+  , fsCheckNs :: !Integer
+  , fsCheckMaxNs :: !Integer
+  , fsChecks :: !Int
+  } deriving (Eq, Show)
+
+filterValidStats :: F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann ([a], FilterStats)
+filterValidStats sp p qs = do
+  (qs', fs) <- liftSMT $ smtBracket "filterValidLHS" $ filterValidStats_ sp p qs
   -- stats
   incBrkt
   incChck (length qs)
   incVald (length qs')
-  return qs'
+  return (qs', fs)
 
-{-# SCC filterValid_ #-}
-filterValid_ :: F.SrcSpan -> F.Expr -> F.Cand a -> SmtM [a]
-filterValid_ sp p qs = catMaybes <$> do
-  smtAssertDecl p
-  forM qs $ \(q, x) ->
+filterValidStats_ :: F.SrcSpan -> F.Expr -> F.Cand a -> SmtM ([a], FilterStats)
+filterValidStats_ sp p qs = do
+  ((), lhsNs) <- timedSmt $ smtAssertDecl p
+  xs <- forM qs $ \(q, x) ->
     smtBracketAt sp "filterValidRHS" $ do
-      smtAssertDecl (F.PNot q)
-      valid <- smtCheckUnsat
-      return $ if valid then Just x else Nothing
+      ((), rhsNs) <- timedSmt $ smtAssertDecl (F.PNot q)
+      (valid, checkNs) <- timedSmt smtCheckUnsat
+      pure (if valid then Just x else Nothing, rhsNs, checkNs)
+  let rhsNs = sum [n | (_, n, _) <- xs]
+      checkNs = sum [n | (_, _, n) <- xs]
+      checkMaxNs = maximum (0 : [n | (_, _, n) <- xs])
+  pure (catMaybes [x | (x, _, _) <- xs], FilterStats lhsNs rhsNs checkNs checkMaxNs (length xs))
+
+timedSmt :: SmtM a -> SmtM (a, Integer)
+timedSmt action = do
+  t0 <- liftIO getMonotonicTimeNSec
+  result <- action
+  t1 <- liftIO getMonotonicTimeNSec
+  pure (result, toInteger (t1 - t0))
 
 smtEnablembqi :: SolveM ann ()
 smtEnablembqi

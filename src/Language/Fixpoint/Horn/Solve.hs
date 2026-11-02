@@ -6,7 +6,10 @@
 module Language.Fixpoint.Horn.Solve (solveHorn, solve) where
 
 import System.Exit ( ExitCode )
-import Control.DeepSeq ( NFData )
+import Control.DeepSeq ( NFData(..) )
+import Control.Monad.State.Strict (State, evalState, get, put)
+import System.IO (hFlush, stdout)
+import GHC.Clock (getMonotonicTimeNSec)
 import Control.Monad (when)
 import qualified Language.Fixpoint.Misc         as Misc
 import qualified Language.Fixpoint.Utils.Files  as Files
@@ -97,8 +100,66 @@ solve :: (F.PPrint a, NFData a, F.Loc a, Show a, F.Fixpoint a) => F.Config -> H.
        -> IO (F.Result (Integer, a))
 ----------------------------------------------------------------------------------
 solve cfg qry = do
+  if F.traceSolver cfg
+    then do
+      let numbered = (fmap (Origin []) qry)
+            { H.qCstr = evalState (numberHeads (H.qCstr qry)) 0 }
+          allOrigins = headOrigins (H.qCstr numbered)
+          transformed = F.eliminate cfg `elem` [F.Horn, F.Existentials]
+          preserve (Origin ids a) = Origin (if transformed then allOrigins else ids) a
+      dumpInputHeads [] (H.qCstr numbered)
+      when transformed $ putStrLn "INPUT_PROVENANCE mode=conservative_frontend_elimination"
+      fmap (fmap (\(i, Origin _ a) -> (i, a))) $ solveQuery cfg (fmap preserve numbered)
+    else solveQuery cfg qry
+
+data Origin a = Origin ![Int] !a deriving (Show)
+
+instance NFData a => NFData (Origin a) where
+  rnf (Origin i a) = rnf i `seq` rnf a
+
+instance F.Loc a => F.Loc (Origin a) where
+  srcSpan (Origin _ a) = F.srcSpan a
+  srcOrigin (Origin ids _) = ids
+
+instance F.Fixpoint a => F.Fixpoint (Origin a) where
+  toFix (Origin _ a) = F.toFix a
+
+instance F.PPrint a => F.PPrint (Origin a) where
+  pprintPrec n t (Origin _ a) = F.pprintPrec n t a
+
+numberHeads :: H.Cstr a -> State Int (H.Cstr (Origin a))
+numberHeads (H.Head p a) = do
+  i <- get
+  put (i + 1)
+  pure $ H.Head p (Origin [i] a)
+numberHeads (H.CAnd cs) = H.CAnd <$> mapM numberHeads cs
+numberHeads (H.All b c) = H.All (fmap (Origin []) b) <$> numberHeads c
+
+headOrigins :: H.Cstr (Origin a) -> [Int]
+headOrigins (H.Head _ (Origin ids _)) = ids
+headOrigins (H.CAnd cs) = concatMap headOrigins cs
+headOrigins (H.All _ c) = headOrigins c
+
+dumpInputHeads :: [String] -> H.Cstr (Origin a) -> IO ()
+dumpInputHeads body (H.Head p (Origin ids _)) = do
+  putStrLn $ "INPUT_HEAD origins=" ++ show ids ++ " body=" ++ show (reverse body)
+    ++ " head=" ++ show (F.showpp p)
+  hFlush stdout
+dumpInputHeads body (H.CAnd cs) = mapM_ (dumpInputHeads body) cs
+dumpInputHeads body (H.All b c) = dumpInputHeads (F.showpp b : body) c
+
+solveQuery :: (F.PPrint a, NFData a, F.Loc a, Show a, F.Fixpoint a)
+           => F.Config -> H.Query a -> IO (F.Result (Integer, a))
+solveQuery cfg qry = do
+  t0 <- getMonotonicTimeNSec
   let c = Tx.uniq $ Tx.flatten $ H.qCstr qry
   whenLoud $ putStrLn "Horn Uniq:"
   whenLoud $ putStrLn $ F.showpp c
   q <- eliminate cfg ({- void $ -} qry { H.qCstr = c })
-  Solver.solve cfg (hornFInfo cfg q)
+  let fi = hornFInfo cfg q
+  when (F.traceSolver cfg) $ do
+    rnf fi `seq` pure ()
+    t1 <- getMonotonicTimeNSec
+    putStrLn $ "PHASE_TIME phase=horn_transform_convert elapsed_ns=" ++ show (t1 - t0)
+    hFlush stdout
+  Solver.solve cfg fi

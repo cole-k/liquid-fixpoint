@@ -67,6 +67,8 @@ import           Data.Aeson
 
 class Loc a where
   srcSpan :: a -> SrcSpan
+  srcOrigin :: a -> [Int]
+  srcOrigin _ = []
 
 -----------------------------------------------------------------------
 -- Additional (orphan) instances for megaparsec's Pos type ------------

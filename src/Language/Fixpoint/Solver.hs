@@ -33,7 +33,9 @@ import qualified Data.Text.Lazy.Encoding          as LT
 import           System.Exit                        (ExitCode (..))
 import           Language.Fixpoint.Verbosity   (whenNormal, whenLoud)
 import           Control.Monad                      (when)
-import           Control.Exception                  (SomeException, catch)
+import           Control.Exception                  (SomeException, catch, evaluate)
+import GHC.Clock (getMonotonicTimeNSec)
+import System.IO (hFlush, stdout)
 import           Control.Exception.Compat
     (ExceptionWithContext(..), displayExceptionContext, wrapExceptionWithContext)
 import           Language.Fixpoint.Solver.EnvironmentReduction
@@ -284,7 +286,13 @@ reduceFInfo cfg fi = do
     return reducedFi
 
 solveNative' !cfg !fi0 = do
+  t0 <- getMonotonicTimeNSec
   (elabParam, si6) <- simplifyFInfo cfg fi0
+  when (traceSolver cfg) $ do
+    _ <- evaluate $ force si6
+    t1 <- getMonotonicTimeNSec
+    putStrLn $ "PHASE_TIME phase=preprocess elapsed_ns=" ++ show (t1 - t0)
+    hFlush stdout
   let scope = sInfoScope cfg si6
   res0 <- {- SCC "Sol.solve" -} Sol.solve cfg elabParam scope $!! si6
   let res = simplifyResult cfg scope res0

@@ -78,6 +78,7 @@ data Config = Config
   , smtTimeout  :: Maybe Int           -- ^ smt timeout in msec
   , elimStats   :: Bool                -- ^ print eliminate stats
   , solverStats :: Bool                -- ^ print solver stats
+  , traceSolver :: Bool                -- ^ emit observational solver diagnostics
   , metadata    :: Bool                -- ^ print meta-data associated with constraints
   , stats       :: Bool                -- ^ compute constraint statistics
   , parts       :: Bool                -- ^ partition FInfo into separate fq files
@@ -258,6 +259,7 @@ defConfig = Config
   , restOrdering       = "rpo"
   , explicitKvars      = False
   , sortedSolution     = False
+  , traceSolver        = False
   }
 
 -- | An individual parsed flag (modifier to Config, verbosity change, or exit).
@@ -311,6 +313,8 @@ fxOptions =
       "(alpha) Print eliminate stats"
   , opt0 "solver-stats"            (\c -> c { solverStats   = True })
       "Print solver stats"
+  , opt0 "trace"                   (\c -> c { traceSolver = True })
+      "Emit observational solver diagnostics"
   , opt0 "save"                    (\c -> c { save          = True })
       "Save Query as .fq and .bfq files"
   , Option [] ["save-bfq-on-error"] (NoArg (FxMod $ \c -> c { saveBfqOnError = True }))

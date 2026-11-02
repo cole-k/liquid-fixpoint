@@ -18,6 +18,8 @@ module Language.Fixpoint.Solver.Solution
 
     -- * Lookup Solution
   , lhsPred
+  , lhsPredInfo
+  , KInfo(..)
 
   , nonCutsResult
 
@@ -295,13 +297,17 @@ lhsPred
   -> F.SimpC a
   -> F.Expr
 lhsPred cfg scope bindingsInSmt be s c =
-    let ap = apply cfg g s bs
-     in F.notracepp _msg $ fst ap
+    F.notracepp _msg $ fst $ lhsPredInfo cfg scope bindingsInSmt be s c
+  where
+    _msg = "LhsPred for id = " ++ show (sid c) ++ " with SOLUTION = " ++ F.showpp s
+
+lhsPredInfo :: F.Loc a => Config -> S.HashSet F.Symbol -> F.IBindEnv
+            -> F.BindEnv a -> Sol.Solution -> F.SimpC a -> ExprInfo
+lhsPredInfo cfg scope bindingsInSmt be s c = apply cfg g s bs
   where
     g          = CEnv ci be scope bs (F.srcSpan c) bindingsInSmt
     bs         = F.senv c
     ci         = sid c
-    _msg       = "LhsPred for id = " ++ show (sid c) ++ " with SOLUTION = " ++ F.showpp s
 
 data CombinedEnv a = CEnv
   { ceCid  :: !Cid
