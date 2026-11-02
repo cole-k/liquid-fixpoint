@@ -31,7 +31,7 @@ module Language.Fixpoint.Solver.Solution
   , alphaEq
   ) where
 
-import           Control.Arrow (second, (***))
+import           Control.Arrow (second)
 import           Control.Monad                  (guard, mplus, when)
 import           Control.Monad.Reader
 import qualified Data.HashSet                   as S
@@ -446,7 +446,8 @@ dropUnsortedExprs cfg g su@(F.Su m)
 hypPred :: Config -> CombinedEnv ann -> Sol.Sol Sol.QBind -> F.KVSub -> Sol.Hyp -> ExprInfo
 hypPred cfg g s ksu hyp =
   let cs = map (cubePred cfg g s ksu) hyp
-   in F.pOr *** mconcatPlus $ unzip cs
+      (es, infos) = unzip cs
+   in (F.pOr es, KI $ M.insertWith (+) (F.ksuKVar ksu) 1 $ kiExpansions $ mconcat infos)
 
 {- | `cubePred g s k su c` returns the predicate for
 
@@ -491,7 +492,7 @@ cubePredExc cfg g s c bs' =
     let psu' = F.pAnd [ F.EEq (F.expr x) e | (x, e) <- M.toList m ]
         (p', kI) = apply cfg g' s bs'
         cubeE = F.pExist yts' (F.pAndNoDedup [p', psu'])
-     in (cubeE, extendKInfo kI (Sol.cuTag c))
+     in (cubeE, kI)
   where
     yts' = symSorts g bs'
     g' = addCEnv  g bs
@@ -519,36 +520,20 @@ _noKvars :: F.Expr -> Bool
 _noKvars = null . V.kvarsExpr
 
 --------------------------------------------------------------------------------
--- | Information about size of formula corresponding to an "eliminated" KVar.
+-- | Diagnostic metadata for expansions of eliminated KVars.
 --------------------------------------------------------------------------------
-data KInfo = KI { kiTags  :: [Tag]
-                , kiDepth :: !Int
-                , kiCubes :: !Integer
-                } deriving (Eq, Ord, Show)
+-- | Structural expansion occurrences in a query, including nested non-cuts.
+-- Kept lazy and separate from the Expr: inspecting counts does not traverse or
+-- deeply evaluate the expanded formula. Not a count of runtime thunk entries.
+newtype KInfo = KI { kiExpansions :: M.HashMap F.KVar Integer }
+  deriving (Eq, Show)
 
 instance Semigroup KInfo where
-  ki <> ki' = KI ts d s
-    where
-      ts    = appendTags (kiTags  ki) (kiTags  ki')
-      d     = max        (kiDepth ki) (kiDepth ki')
-      s     = (*)        (kiCubes ki) (kiCubes ki')
+  KI a <> KI b = KI (M.unionWith (+) a b)
 
 instance Monoid KInfo where
-  mempty  = KI [] 0 1
+  mempty  = KI M.empty
   mappend = (<>)
-
-mplusKInfo :: KInfo -> KInfo -> KInfo
-mplusKInfo ki ki' = (mappend ki ki') { kiCubes = kiCubes ki + kiCubes ki'}
-
-mconcatPlus :: [KInfo] -> KInfo
-mconcatPlus = foldr mplusKInfo mempty
-
-appendTags :: [Tag] -> [Tag] -> [Tag]
-appendTags ts ts' = Misc.sortNub (ts ++ ts')
-
-extendKInfo :: KInfo -> F.Tag -> KInfo
-extendKInfo ki t = ki { kiTags  = appendTags [t] (kiTags  ki)
-                      , kiDepth = 1  +            kiDepth ki }
 
 -- | Simplifies existential expressions with unused or inconsequential bindings.
 --

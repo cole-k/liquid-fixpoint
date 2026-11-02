@@ -9,7 +9,6 @@ import System.Exit ( ExitCode )
 import Control.DeepSeq ( NFData(..) )
 import Control.Monad.State.Strict (State, evalState, get, put)
 import System.IO (hFlush, stdout)
-import GHC.Clock (getMonotonicTimeNSec)
 import Control.Monad (when)
 import qualified Language.Fixpoint.Misc         as Misc
 import qualified Language.Fixpoint.Utils.Files  as Files
@@ -107,7 +106,7 @@ solve cfg qry = do
           allOrigins = headOrigins (H.qCstr numbered)
           transformed = F.eliminate cfg `elem` [F.Horn, F.Existentials]
           preserve (Origin ids a) = Origin (if transformed then allOrigins else ids) a
-      dumpInputHeads [] (H.qCstr numbered)
+      dumpInputHeads (H.qCstr numbered)
       when transformed $ putStrLn "INPUT_PROVENANCE mode=conservative_frontend_elimination"
       fmap (fmap (\(i, Origin _ a) -> (i, a))) $ solveQuery cfg (fmap preserve numbered)
     else solveQuery cfg qry
@@ -140,26 +139,19 @@ headOrigins (H.Head _ (Origin ids _)) = ids
 headOrigins (H.CAnd cs) = concatMap headOrigins cs
 headOrigins (H.All _ c) = headOrigins c
 
-dumpInputHeads :: [String] -> H.Cstr (Origin a) -> IO ()
-dumpInputHeads body (H.Head p (Origin ids _)) = do
-  putStrLn $ "INPUT_HEAD origins=" ++ show ids ++ " body=" ++ show (reverse body)
-    ++ " head=" ++ show (F.showpp p)
+dumpInputHeads :: H.Cstr (Origin a) -> IO ()
+dumpInputHeads (H.Head _ (Origin ids _)) = do
+  putStrLn $ "INPUT_HEAD origins=" ++ show ids
   hFlush stdout
-dumpInputHeads body (H.CAnd cs) = mapM_ (dumpInputHeads body) cs
-dumpInputHeads body (H.All b c) = dumpInputHeads (F.showpp b : body) c
+dumpInputHeads (H.CAnd cs) = mapM_ dumpInputHeads cs
+dumpInputHeads (H.All _ c) = dumpInputHeads c
 
 solveQuery :: (F.PPrint a, NFData a, F.Loc a, Show a, F.Fixpoint a)
            => F.Config -> H.Query a -> IO (F.Result (Integer, a))
 solveQuery cfg qry = do
-  t0 <- getMonotonicTimeNSec
   let c = Tx.uniq $ Tx.flatten $ H.qCstr qry
   whenLoud $ putStrLn "Horn Uniq:"
   whenLoud $ putStrLn $ F.showpp c
   q <- eliminate cfg ({- void $ -} qry { H.qCstr = c })
   let fi = hornFInfo cfg q
-  when (F.traceSolver cfg) $ do
-    rnf fi `seq` pure ()
-    t1 <- getMonotonicTimeNSec
-    putStrLn $ "PHASE_TIME phase=horn_transform_convert elapsed_ns=" ++ show (t1 - t0)
-    hFlush stdout
   Solver.solve cfg fi

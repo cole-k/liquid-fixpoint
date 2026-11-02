@@ -15,8 +15,8 @@ module Language.Fixpoint.Solver.Monad
          -- * SMT Query
        , filterRequired
        , filterValid
-       , filterValidStats
-       , FilterStats(..)
+       , recordNonCutExpansions
+       , nonCutExpansions
        , smtEnablembqi
        , sendConcreteBindingsToSMT
 
@@ -71,6 +71,7 @@ data SolverState ann = SS
   { ssCtx     :: !Context         -- ^ SMT Solver Context
   , ssStats   :: !Stats           -- ^ Solver Statistics
   , ssElabParam :: !ElabParam      -- ^ Elaboration Parameters
+  , ssNonCutExpansions :: !(M.HashMap (String, F.KVar) Integer)
   }
 
 stats0    :: F.GInfo c b -> Stats
@@ -86,23 +87,24 @@ runSolverM cfg sI elabParam act =
     res <- runStateT act' (s0 ctx)
     return (fst res)
   where
-    s0 ctx   = SS ctx (stats0 fi) elabParam
+    s0 ctx   = SS ctx (stats0 fi) elabParam M.empty
     act'     = do
-      t0 <- liftIO getMonotonicTimeNSec
+      t0 <- liftIO clock
       assumesAxioms (F.asserts fi)
-      t1 <- liftIO getMonotonicTimeNSec
+      t1 <- liftIO clock
       liftIO $ reportTime "global_axioms" t0 t1
       act
     release  = cleanupContext
     acquire  = do
-      t0 <- getMonotonicTimeNSec
+      t0 <- clock
       ctx <- makeContextWithSEnv cfg file initEnv (F.defns fi)
-      t1 <- getMonotonicTimeNSec
+      t1 <- clock
       reportTime "smt_context_init" t0 t1
       pure ctx
     reportTime phase t0 t1 = when (C.traceSolver cfg) $ do
       putStrLn $ "PHASE_TIME phase=" ++ phase ++ " elapsed_ns=" ++ show (t1 - t0)
       hFlush stdout
+    clock = if C.traceSolver cfg then getMonotonicTimeNSec else pure 0
     initEnv  = symbolEnv cfg fi
     file     = C.srcFile cfg
     -- only linear arithmetic when: linear flag is on or solver /= Z3
@@ -191,44 +193,31 @@ filterRequired = error "TBD:filterRequired"
 {-# SCC filterValid #-}
 filterValid :: F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann [a]
 --------------------------------------------------------------------------------
-filterValid sp p qs = fst <$> filterValidStats sp p qs
-
-data FilterStats = FilterStats
-  { fsLhsAssertNs :: !Integer
-  , fsRhsAssertNs :: !Integer
-  , fsCheckNs :: !Integer
-  , fsCheckMaxNs :: !Integer
-  , fsChecks :: !Int
-  } deriving (Eq, Show)
-
-filterValidStats :: F.SrcSpan -> F.Expr -> F.Cand a -> SolveM ann ([a], FilterStats)
-filterValidStats sp p qs = do
-  (qs', fs) <- liftSMT $ smtBracket "filterValidLHS" $ filterValidStats_ sp p qs
+filterValid sp p qs = do
+  qs' <- liftSMT $ smtBracket "filterValidLHS" $ filterValid_ sp p qs
   -- stats
   incBrkt
   incChck (length qs)
   incVald (length qs')
-  return (qs', fs)
+  return qs'
 
-filterValidStats_ :: F.SrcSpan -> F.Expr -> F.Cand a -> SmtM ([a], FilterStats)
-filterValidStats_ sp p qs = do
-  ((), lhsNs) <- timedSmt $ smtAssertDecl p
-  xs <- forM qs $ \(q, x) ->
+{-# SCC filterValid_ #-}
+filterValid_ :: F.SrcSpan -> F.Expr -> F.Cand a -> SmtM [a]
+filterValid_ sp p qs = catMaybes <$> do
+  smtAssertDecl p
+  forM qs $ \(q, x) ->
     smtBracketAt sp "filterValidRHS" $ do
-      ((), rhsNs) <- timedSmt $ smtAssertDecl (F.PNot q)
-      (valid, checkNs) <- timedSmt smtCheckUnsat
-      pure (if valid then Just x else Nothing, rhsNs, checkNs)
-  let rhsNs = sum [n | (_, n, _) <- xs]
-      checkNs = sum [n | (_, _, n) <- xs]
-      checkMaxNs = maximum (0 : [n | (_, _, n) <- xs])
-  pure (catMaybes [x | (x, _, _) <- xs], FilterStats lhsNs rhsNs checkNs checkMaxNs (length xs))
+      smtAssertDecl (F.PNot q)
+      valid <- smtCheckUnsat
+      return $ if valid then Just x else Nothing
 
-timedSmt :: SmtM a -> SmtM (a, Integer)
-timedSmt action = do
-  t0 <- liftIO getMonotonicTimeNSec
-  result <- action
-  t1 <- liftIO getMonotonicTimeNSec
-  pure (result, toInteger (t1 - t0))
+recordNonCutExpansions :: String -> M.HashMap F.KVar Integer -> SolveM ann ()
+recordNonCutExpansions phase counts = modify $ \s -> s
+  { ssNonCutExpansions = M.unionWith (+) (ssNonCutExpansions s)
+      (M.fromList [((phase, k), n) | (k, n) <- M.toList counts]) }
+
+nonCutExpansions :: SolveM ann (M.HashMap (String, F.KVar) Integer)
+nonCutExpansions = ssNonCutExpansions <$> get
 
 smtEnablembqi :: SolveM ann ()
 smtEnablembqi

@@ -70,11 +70,7 @@ solve
 --------------------------------------------------------------------------------
 
 solve cfg elabParam scope fi = do
-    t0 <- getMonotonicTimeNSec
     when (traceSolver cfg) $ do
-      _ <- evaluate $ force (map (rScc . snd) (M.toList (cRank (siDeps sI))), cSucc (siDeps sI))
-      _ <- evaluate $ force (Sol.sHyp (siSol sI), Sol.sScp (siSol sI))
-      phaseTime "dependency_fusion_setup" t0
       dumpManifest fi sI
     whenLoud $ donePhase Misc.Loud "Worklist Initialize"
     vb <- getVerbosity
@@ -85,13 +81,9 @@ solve cfg elabParam scope fi = do
   where
     act :: SolveM a (F.Result (Integer, a), Stats)
     act = do
-      t0 <- liftIO getMonotonicTimeNSec
       ctx <- getContext
       let sEnv = symbolEnv cfg fi
           s1 = s0{Sol.sMap = M.map (elabQBind ctx "solve" sEnv) (Sol.sMap s0)}
-      liftIO $ when (traceSolver cfg) $ do
-        _ <- evaluate $ force (Sol.sMap s1)
-        phaseTime "candidate_elaboration" t0
       solve_ cfg scope fi s1 wkl
     -- solverInfo computes the set of cut and non-cut kvars, then initializes
     -- the solutions of the non-cut KVars (in the sHyp field)
@@ -149,15 +141,15 @@ solve_ :: (NFData a, F.Fixpoint a, F.Loc a)
        -> SolveM a (F.Result (Integer, a), Stats)
 --------------------------------------------------------------------------------
 solve_ cfg scope fi s2 wkl = do
-  t0 <- liftIO getMonotonicTimeNSec
+  t0 <- liftIO $ traceClock cfg
   liftSMT $ smtComment "solve: start"
   (s3, res0) <- sendConcreteBindingsToSMT F.emptyIBindEnv (F.bs fi) $ \bindingsInSmt -> do
     -- let s3   = solveEbinds fi s2
     s3       <- {- SCC "sol-refine" -} refine scope bindingsInSmt (F.bs fi) s2 wkl
     liftIO $ when (traceSolver cfg) $ phaseTime "bindings_and_refinement" t0
-    t1 <- liftIO getMonotonicTimeNSec
+    t1 <- liftIO $ traceClock cfg
     res0     <- {- SCC "sol-result" -} result scope bindingsInSmt cfg fi (W.unsatCandidates wkl) s3
-    liftIO $ when (traceSolver cfg) $ phaseTime "validation_and_materialization" t1
+    liftIO $ when (traceSolver cfg) $ phaseTime "validation_and_result_construction" t1
     return (s3, res0)
 
   (fi1, res1) <- case resStatus res0 of  {- first run the interpreter -}
@@ -188,7 +180,21 @@ solve_ cfg scope fi s2 wkl = do
   liftSMT $ smtComment "solve: finished"
   st      <- stats
   let res3 = {- SCC "sol-tidy" -} tidyResult cfg res2
-  return $!! (res3, st)
+  when (traceSolver cfg) $ do
+    counts <- nonCutExpansions
+    liftIO $ mapM_ (\((phase, k), n) -> diagnostic $ "NONCUT_EXPANSIONS phase=" ++ phase
+      ++ " kvar=" ++ show k ++ " count=" ++ show n)
+      (L.sortOn (\((phase, k), _) -> (phase, show k)) $ M.toList counts)
+  -- The original return $!! below already deeply evaluates Result, including
+  -- Delayed non-cut output formulas. Time that existing demand, not a new force
+  -- of use-site expansions. Includes tidying/cut results/status as well.
+  t0 <- liftIO $ traceClock cfg
+  if traceSolver cfg
+    then do
+      res <- liftIO $ evaluate $ force (res3, st)
+      liftIO $ phaseTime "result_materialization" t0
+      return res
+    else return $!! (res3, st)
 
 
 --------------------------------------------------------------------------------
@@ -249,28 +255,26 @@ refine
 --------------------------------------------------------------------------------
 refine scope bindingsInSmt be0 s0 w0 = do
   cfg <- T.config <$> getContext
-  liftIO $ when (traceSolver cfg) $ candidateCounts "initial" s0
-  go be0 s0 w0 M.empty
+  go cfg be0 s0 w0 M.empty
   where
-    go :: F.BindEnv a -> Sol.Solution -> W.Worklist a -> M.HashMap Int Profile -> SolveM a Sol.Solution
-    go be s w profiles
+    go :: Config -> F.BindEnv a -> Sol.Solution -> W.Worklist a -> M.HashMap Int Profile -> SolveM a Sol.Solution
+    go cfg be s w profiles
       | Just (c, w', newScc, rnk) <- W.pop w = do
          i       <- tickIter newScc
-         cfg <- T.config <$> getContext
-         t0 <- liftIO getMonotonicTimeNSec
-         (b, s', p) <- refineC scope bindingsInSmt be i s c
+         t0 <- liftIO $ traceClock cfg
+         (b, s', info, assertions) <- refineC scope bindingsInSmt be i s c
          b `seq` pure ()
-         t1 <- liftIO getMonotonicTimeNSec
-         let p' = p { elapsed = toInteger (t1 - t0), visits = 1, changes = if b then 1 else 0 }
+         t1 <- liftIO $ traceClock cfg
+         when (traceSolver cfg) $
+           recordNonCutExpansions "refine" (M.map (* toInteger assertions) $ S.kiExpansions info)
+         let p' = Profile (toInteger (t1 - t0)) 1 (if b then 1 else 0)
          liftIO $ when (traceSolver cfg) $ diagnostic $ "SCC_VISIT rank=" ++ show rnk
            ++ " constraint=" ++ show (F.subcId c) ++ " origins=" ++ show (F.srcOrigin (F.sinfo c)) ++ profileFields p'
          lift $ writeLoud $ refineMsg i c b rnk (showpp s')
          let w'' = if b then W.push c w' else w'
-         go be s' w'' (if traceSolver cfg then M.insertWith addProfile rnk p' profiles else profiles)
+         go cfg be s' w'' (if traceSolver cfg then M.insertWith addProfile rnk p' profiles else profiles)
       | otherwise = do
-          cfg <- T.config <$> getContext
           liftIO $ when (traceSolver cfg) $ do
-            candidateCounts "final" s
             mapM_ (\(rank, p) -> diagnostic $ "SCC_TIME rank=" ++ show rank ++ profileFields p) (L.sortOn fst $ M.toList profiles)
           return s
       where
@@ -290,31 +294,19 @@ refineC
   -> Int
   -> Sol.Solution
   -> F.SimpC a
-  -> SolveM a (Bool, Sol.Solution, Profile)
+  -> SolveM a (Bool, Sol.Solution, S.KInfo, Int)
 ---------------------------------------------------------------------------
 refineC scope bindingsInSmt be _i s c =
   do let krhs = rhsCands s
      cfg <- T.config <$> getContext
      if all (null . snd) krhs
-        then return (False, s, zeroProfile)
+        then return (False, s, mempty, 0)
         else do
-          t0 <- liftIO getMonotonicTimeNSec
           let (lhs, info) = S.lhsPredInfo cfg scope bindingsInSmt be s c
-          liftIO $ when (traceSolver cfg) $ evaluate (rnf lhs)
-          t1 <- liftIO getMonotonicTimeNSec
-          results <- forM krhs $ \(k, rhs) -> do
-            (valid, fs) <- filterValidStats (cstrSpan c) lhs rhs
-            let dropped = [q | (_, q) <- rhs, q `notElem` valid]
-            liftIO $ when (traceSolver cfg) $ do
-              queryStats "refine" c lhs info fs
-              when (not (null dropped)) $ diagnostic $ "QUALIFIER_REMOVAL constraint=" ++ show (F.subcId c)
-                ++ " origins=" ++ show (F.srcOrigin (F.sinfo c)) ++ " kvar=" ++ show k
-                ++ " count=" ++ show (length dropped) ++ " concrete_body=" ++ show (null (V.envKVars be c))
-                ++ " predicates=" ++ show (map (F.showpp . Sol.eqPred) dropped)
-            pure ((k, Sol.QB valid), fromFilter fs (length rhs - length valid))
-          let (b, s') = S.update s (map fst results)
-              p = foldr addProfile zeroProfile (map snd results)
-          return (b, s', p { forcing = toInteger (t1 - t0) })
+          kqs <- forM krhs $ \(k, rhs) ->
+            (,) k . Sol.QB <$> filterValid (cstrSpan c) lhs rhs
+          let (b, s') = S.update s kqs
+          return (b, s', info, length krhs)
   where
     rhsCands :: Sol.Solution -> [(F.KVar, Sol.Cand Sol.EQual)]
     rhsCands s = M.toList $ M.fromList $ map cnd ks
@@ -432,19 +424,17 @@ isUnsat scope bindingsInSmt be s c = do
   -- lift   $ printf "isUnsat %s" (show (F.subcId c))
   _     <- tickIter True -- newScc
   cfg <- T.config <$> getContext
-  t0 <- liftIO getMonotonicTimeNSec
+  t0 <- liftIO $ traceClock cfg
   let (lp, info) = S.lhsPredInfo cfg scope bindingsInSmt be s c
       rp = rhsPred c
-  liftIO $ when (traceSolver cfg) $ evaluate (rnf lp)
-  t1 <- liftIO getMonotonicTimeNSec
-  (valid, fs) <- filterValidStats (cstrSpan c) lp [(rp, ())]
-  t2 <- liftIO getMonotonicTimeNSec
-  let res = null valid
-      p = (fromFilter fs 0) { elapsed = toInteger (t2 - t0), forcing = toInteger (t1 - t0), visits = 1 }
+  res <- not <$> isValid (cstrSpan c) lp rp
+  res `seq` pure ()
+  t1 <- liftIO $ traceClock cfg
+  when (traceSolver cfg) $ recordNonCutExpansions "concrete" (S.kiExpansions info)
+  let p = Profile (toInteger (t1 - t0)) 1 0
   liftIO $ when (traceSolver cfg) $ do
     diagnostic $ "CONCRETE_TIME constraint=" ++ show (F.subcId c)
       ++ " origins=" ++ show (F.srcOrigin (F.sinfo c)) ++ " valid=" ++ show (not res) ++ profileFields p
-    queryStats "result" c lp info fs
   lift   $ whenLoud $ showUnsat res (F.subcId c) lp rp
   return res
 
@@ -469,26 +459,15 @@ isValid :: F.SrcSpan -> F.Expr -> F.Expr -> SolveM ann Bool
 isValid sp p q = not . null <$> filterValid sp p [(q, ())]
 
 data Profile = Profile
-  { elapsed, visits, changes, removed, forcing, lhsAssert, rhsAssert, checkTime, checkMax, checks :: !Integer }
-
-zeroProfile :: Profile
-zeroProfile = Profile 0 0 0 0 0 0 0 0 0 0
+  { elapsed, visits, changes :: !Integer }
 
 addProfile :: Profile -> Profile -> Profile
 addProfile a b = Profile
   (elapsed a + elapsed b) (visits a + visits b) (changes a + changes b)
-  (removed a + removed b) (forcing a + forcing b) (lhsAssert a + lhsAssert b)
-  (rhsAssert a + rhsAssert b) (checkTime a + checkTime b) (max (checkMax a) (checkMax b)) (checks a + checks b)
-
-fromFilter :: FilterStats -> Int -> Profile
-fromFilter fs n = zeroProfile { removed = toInteger n, lhsAssert = fsLhsAssertNs fs,
-  rhsAssert = fsRhsAssertNs fs, checkTime = fsCheckNs fs, checkMax = fsCheckMaxNs fs, checks = toInteger (fsChecks fs) }
 
 profileFields :: Profile -> String
 profileFields p = concat [" " ++ name ++ "=" ++ show value | (name, value) <-
-  [("elapsed_ns", elapsed p), ("visits", visits p), ("changes", changes p), ("removed", removed p),
-   ("force_ns", forcing p), ("lhs_assert_ns", lhsAssert p), ("rhs_assert_ns", rhsAssert p),
-   ("check_ns", checkTime p), ("check_max_ns", checkMax p), ("checks", checks p)]]
+  [("elapsed_ns", elapsed p), ("visits", visits p), ("changes", changes p)]]
 
 diagnostic :: String -> IO ()
 diagnostic msg = putStrLn msg >> hFlush stdout
@@ -498,66 +477,22 @@ phaseTime name start = do
   end <- getMonotonicTimeNSec
   diagnostic $ "PHASE_TIME phase=" ++ name ++ " elapsed_ns=" ++ show (end - start)
 
-candidateCounts :: String -> Sol.Solution -> IO ()
-candidateCounts phase s = mapM_ (\(k, Sol.QB qs) -> diagnostic $
-  "CANDIDATES phase=" ++ phase ++ " kvar=" ++ show k ++ " count=" ++ show (length qs)) (L.sortOn (show . fst) $ M.toList $ Sol.sMap s)
-
-queryStats :: String -> F.SimpC a -> F.Expr -> S.KInfo -> FilterStats -> IO ()
-queryStats phase c lhs info fs = diagnostic $ "NONCUT_QUERY phase=" ++ phase
-  ++ " constraint=" ++ show (F.subcId c) ++ " nodes=" ++ show (exprNodes lhs)
-  ++ " depth=" ++ show (S.kiDepth info)
-  ++ profileFields (fromFilter fs 0)
-
-exprNodes :: F.Expr -> Int
-exprNodes e = 1 + sum (map exprNodes children)
-  where
-    children = case e of
-      F.EApp a b -> [a,b]
-      F.ENeg a -> [a]
-      F.EBin _ a b -> [a,b]
-      F.ELet _ a b -> [a,b]
-      F.EIte a b c -> [a,b,c]
-      F.ECst a _ -> [a]
-      F.ELam _ a -> [a]
-      F.ETApp a _ -> [a]
-      F.ETAbs a _ -> [a]
-      F.PAnd xs -> xs
-      F.POr xs -> xs
-      F.PNot a -> [a]
-      F.PImp a b -> [a,b]
-      F.PIff a b -> [a,b]
-      F.PAtom _ a b -> [a,b]
-      F.PAll _ a -> [a]
-      F.PExist _ a -> [a]
-      F.ECoerc _ _ a -> [a]
-      _ -> []
+traceClock :: Config -> IO Word64
+traceClock cfg = if traceSolver cfg then getMonotonicTimeNSec else pure 0
 
 dumpManifest :: F.Loc a => F.SInfo a -> SolverInfo a -> IO ()
 dumpManifest fi si = do
   mapM_ dump (L.sortOn fst $ M.toList grouped)
   mapM_ concrete [c | c <- M.elems (F.cm fi), V.isConcC c]
+  mapM_ noncut (L.sortOn (show . fst) $ M.toList $ Sol.sHyp $ siSol si)
   where
-    be = F.bs fi
     ranks = cRank (siDeps si)
-    hyps = Sol.sHyp (siSol si)
     rank c = rScc (lookupCMap ranks (F.subcId c))
     grouped = M.fromListWith (++) [(rank c, [c]) | c <- M.elems (F.cm (siQuery si)), not (V.isConcC c)]
     unique :: Ord b => [b] -> [b]
-    unique = L.nub . L.sort
+    unique = map head . L.group . L.sort
     origins cs = unique $ concatMap (F.srcOrigin . F.sinfo) cs
-    go seen defs [] = (seen, defs)
-    go seen defs (k:ks)
-      | S.member k seen = go seen defs ks
-      | otherwise = case M.lookup k hyps of
-          Nothing -> go (S.insert k seen) defs ks
-          Just cubes -> let ids = S.fromList (map Sol.cuId cubes)
-                            ds = [c | i <- S.toList ids, Just c <- [M.lookup i (F.cm fi)]]
-                        in go (S.insert k seen) (S.union defs ids) (concatMap (V.envKVars be) ds ++ ks)
-    fields cs = let (inputs, defs) = go S.empty S.empty (concatMap (V.envKVars be) cs)
-                    ds = [c | i <- S.toList defs, Just c <- [M.lookup i (F.cm fi)]]
-                in " origins=" ++ show (origins cs) ++ " noncut_origins=" ++ show (origins ds)
-                   ++ " input_cut_kvars=" ++ show (map show $ L.sortOn show [k | k <- S.toList inputs, not (M.member k hyps)])
-                   ++ " noncut_kvars=" ++ show (map show $ L.sortOn show [k | k <- S.toList inputs, M.member k hyps])
+    fields cs = " origins=" ++ show (origins cs)
     dump (r, cs) = diagnostic $ "SCC_MANIFEST rank=" ++ show r
       ++ " constraints=" ++ show (unique $ map F.subcId cs)
       ++ " head_kvars=" ++ show (unique $ map show $ concatMap V.rhsKVars cs)
@@ -565,6 +500,9 @@ dumpManifest fi si = do
                                                        Just x <- [M.lookup j ranks], rScc x /= r]) ++ fields cs
     concrete c = diagnostic $ "CONCRETE_MANIFEST constraint=" ++ show (F.subcId c)
       ++ " rank=" ++ show (rank c) ++ fields [c]
+    noncut (k, cubes) = diagnostic $ "NONCUT_MANIFEST kvar=" ++ show k
+      ++ " constraints=" ++ show (unique $ map Sol.cuId cubes)
+      ++ fields [c | cube <- cubes, Just c <- [M.lookup (Sol.cuId cube) (F.cm fi)]]
 
 cstrSpan :: (F.Loc a) => F.SimpC a -> F.SrcSpan
 cstrSpan = F.srcSpan . F.sinfo
