@@ -71,6 +71,7 @@ solve
 
 solve cfg elabParam scope fi = do
     when (traceSolver cfg) $ do
+      diagnostic "DIAGNOSTICS version=2"
       dumpManifest fi sI
     whenLoud $ donePhase Misc.Loud "Worklist Initialize"
     vb <- getVerbosity
@@ -180,6 +181,11 @@ solve_ cfg scope fi s2 wkl = do
   liftSMT $ smtComment "solve: finished"
   st      <- stats
   let res3 = {- SCC "sol-tidy" -} tidyResult cfg res2
+  liftIO $ when (traceSolver cfg) $ case resStatus res2 of
+    F.Safe _ -> diagnostic "FINAL_RESULT safe=True origins=[]"
+    F.Unsafe _ bads -> diagnostic $ "FINAL_RESULT safe=False origins=" ++ show
+      (L.nub $ L.sort $ concat [F.srcOrigin (F.sinfo c) | (cid, _) <- bads, Just c <- [M.lookup cid (F.cm fi)]])
+    _ -> pure ()
   when (traceSolver cfg) $ do
     counts <- nonCutExpansions
     liftIO $ mapM_ (\((phase, k), n) -> diagnostic $ "NONCUT_EXPANSIONS phase=" ++ phase
@@ -482,6 +488,10 @@ traceClock cfg = if traceSolver cfg then getMonotonicTimeNSec else pure 0
 
 dumpManifest :: F.Loc a => F.SInfo a -> SolverInfo a -> IO ()
 dumpManifest fi si = do
+  mapM_ (\k -> diagnostic $ "KVAR_CLASS kvar=" ++ show k ++ " classification=cut")
+    (L.sortOn show $ S.toList $ siVars si)
+  mapM_ (\k -> diagnostic $ "KVAR_CLASS kvar=" ++ show k ++ " classification=noncut")
+    (L.sortOn show $ M.keys $ Sol.sHyp $ siSol si)
   mapM_ dump (L.sortOn fst $ M.toList grouped)
   mapM_ concrete [c | c <- M.elems (F.cm fi), V.isConcC c]
   mapM_ noncut (L.sortOn (show . fst) $ M.toList $ Sol.sHyp $ siSol si)
